@@ -1,0 +1,16 @@
+--- staging/cli.js.orig
++++ staging/cli.js
+@@ -136234,12 +136234,12 @@
+             if (q.setEncoding("utf8"), A) {
+                 if (this.rawModeEnabledCount === 0) {
+-                    if (Ma(), q.ref(), q.setRawMode(!0), q.addListener("readable", this.handleReadable), this.props.stdout.write(B_7), this.props.stdout.write(qK8), F_7.includes(o8.terminal ?? "")) this.props.stdout.write(B27)
++                    if (Ma(), q.ref(), q.setRawMode(!0), q.addListener("readable", this.handleReadable), this.props.stdout.write(B_7), (o8.terminal !== "xterm") && this.props.stdout.write(qK8), F_7.includes(o8.terminal ?? "")) this.props.stdout.write(B27)
+                 }
+                 this.rawModeEnabledCount++;
+                 return
+             }
+             if (--this.rawModeEnabledCount === 0) {
+                 if (F_7.includes(o8.terminal ?? "")) this.props.stdout.write(bJ6);
+-                this.props.stdout.write(k46), this.props.stdout.write(Aj6), q.setRawMode(!1), q.removeListener("readable", this.handleReadable), q.unref()
++                (o8.terminal !== "xterm") && this.props.stdout.write(k46), this.props.stdout.write(Aj6), q.setRawMode(!1), q.removeListener("readable", this.handleReadable), q.unref()
+             }

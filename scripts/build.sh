@@ -22,6 +22,13 @@ echo "==> Beautifying cli.js"
 npx js-beautify@latest --type js -f "$STAGING/cli.js" -o "$STAGING/cli.js.pretty"
 mv "$STAGING/cli.js.pretty" "$STAGING/cli.js"
 
+echo "==> Applying xterm patches"
+for patch in patches/*.patch; do
+    [ -f "$patch" ] || continue
+    echo "    Applying $(basename "$patch")"
+    patch -p0 < "$patch"
+done
+
 echo "==> Building ripgrep ${RG_VERSION} from source"
 git clone --depth 1 --branch "${RG_VERSION}" https://github.com/BurntSushi/ripgrep.git ripgrep-src
 cd ripgrep-src

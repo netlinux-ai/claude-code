@@ -1,0 +1,10 @@
+--- staging/cli.js.orig
++++ staging/cli.js
+@@ -39914,6 +39914,7 @@
+                     return 2
+             }
+         }
++        if (CX.XTERM_VERSION) return 2;
+         if (/-256(color)?$/i.test(CX.TERM)) return 2;
+         if (/^screen|^xterm|^vt100|^vt220|^rxvt|color|ansi|cygwin|linux/i.test(CX.TERM)) return 1;
+         if ("COLORTERM" in CX) return 1;
