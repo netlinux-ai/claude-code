@@ -52,7 +52,7 @@ jobs:
             --nodoc \
             --pakdir=. \
             --install=no \
-            --fstrans=yes \
+            --fstrans=no \
             make install
 
       - name: Repack .deb for reprepro compatibility
