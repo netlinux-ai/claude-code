@@ -162,49 +162,46 @@ load_session() {
 }
 
 # --- Add a message to the session ---
-add_msg() {
-  local role="$1"
-  # role is "user" or "assistant"
-  local msg_dir
-  msg_dir=$(printf '%s/%05d-%s' "$SESSION_DIR" "$MSG_SEQ" "$role")
-  mkdir -p "$msg_dir"
+# Note: we avoid $(add_msg ...) subshells because MSG_SEQ increments would be lost.
+# Instead, each function computes the dir inline.
+
+next_msg_dir() {
+  # Sets NEXT_DIR and increments MSG_SEQ — call directly, never in $(...)
+  NEXT_DIR=$(printf '%s/%05d-%s' "$SESSION_DIR" "$MSG_SEQ" "$1")
+  mkdir -p "$NEXT_DIR"
   MSG_SEQ=$(( MSG_SEQ + 1 ))
-  echo "$msg_dir"
 }
 
 # Write a user text message
 add_user_text() {
   local text="$1"
-  local d
-  d=$(add_msg "user")
-  printf '%s' "$text" > "$d/text.md"
+  next_msg_dir "user"
+  printf '%s' "$text" > "$NEXT_DIR/text.md"
 }
 
 # Write an assistant response (text + optional tool_use)
 add_assistant_response() {
   local content_json="$1"
-  local d
-  d=$(add_msg "assistant")
+  next_msg_dir "assistant"
 
   # Extract and save text
   local text
   text=$(printf '%s' "$content_json" | jq -r '[.[] | select(.type=="text") | .text] | join("\n")')
-  [[ -n "$text" ]] && printf '%s' "$text" > "$d/text.md"
+  [[ -n "$text" ]] && printf '%s' "$text" > "$NEXT_DIR/text.md"
 
   # Extract and save tool_use blocks
   local tool_uses
   tool_uses=$(printf '%s' "$content_json" | jq -c '[.[] | select(.type=="tool_use")]')
   if [[ "$tool_uses" != "[]" ]]; then
-    printf '%s' "$tool_uses" > "$d/tool_use.json"
+    printf '%s' "$tool_uses" > "$NEXT_DIR/tool_use.json"
   fi
 }
 
 # Write tool results as a user message
 add_tool_results() {
   local results_json="$1"
-  local d
-  d=$(add_msg "user")
-  printf '%s' "$results_json" > "$d/tool_result.json"
+  next_msg_dir "user"
+  printf '%s' "$results_json" > "$NEXT_DIR/tool_result.json"
 }
 
 # =============================================================================
