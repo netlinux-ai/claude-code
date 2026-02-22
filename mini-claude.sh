@@ -722,9 +722,8 @@ while true; do
     fi
 
     # Process tool calls — write each result to a temp file, then merge
-    local results_dir
     results_dir=$(mktemp -d)
-    local tool_seq=0
+    tool_seq=0
     while IFS= read -r row; do
       tool_id=$(printf '%s' "$row" | jq -r '.id')
       tool_name=$(printf '%s' "$row" | jq -r '.name')
@@ -743,7 +742,6 @@ while true; do
     done < <(printf '%s' "$content" | jq -c '.[] | select(.type=="tool_use")')
 
     # Merge all results into a single array and save
-    local merged_results
     merged_results=$(jq -s '.' "$results_dir"/*.json)
     rm -rf "$results_dir"
     add_tool_results "$merged_results"
