@@ -4,7 +4,7 @@ set -euo pipefail
 # --- Config ---
 API_URL="https://api.anthropic.com/v1/messages"
 MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
-MAX_TOKENS=4096
+MAX_TOKENS=16384
 SKIP_PERMISSIONS=false
 
 COMPACT_THRESHOLD=320000  # ~80k tokens at chars/4
