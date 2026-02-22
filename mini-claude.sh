@@ -120,7 +120,7 @@ fi
 # --- List message dirs in order ---
 msg_dirs() {
   local d="${1:-$SESSION_DIR}"
-  find "$d" -maxdepth 1 -type d -name '[0-9]*-*' | sort
+  find "$d" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*-*' | sort
 }
 
 msg_count() {
@@ -280,7 +280,6 @@ repair_session() {
   while [[ $i -lt ${#dirs[@]} ]]; do
     local d="${dirs[$i]}"
     local role
-    role="${$(basename "$d")#*-}"  # bash indirection won't work, use cut
     role=$(basename "$d" | cut -d- -f2-)
 
     if [[ "$role" == "assistant" ]] && [[ -f "$d/tool_use.json" ]]; then
