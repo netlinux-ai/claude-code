@@ -1,4 +1,4 @@
-# mini-claude: A Complete Agentic AI Shell in 750 Lines of Bash
+# mini-claude: A Complete Agentic AI Shell in ~750 Lines of Bash
 
 ## What It Is
 
@@ -131,7 +131,7 @@ After every assistant response (when the agent loop completes), mini-claude chec
 
 | Aspect | mini-claude | Claude Code |
 |---|---|---|
-| **Size** | 749 lines, single bash file | ~215 MB compiled Node.js application |
+| **Size** | ~750 lines, single bash file | ~215 MB compiled Node.js application |
 | **Dependencies** | `curl`, `jq` | Node.js runtime, bundled binaries (ripgrep, tree-sitter) |
 | **Tools** | 3 (`bash`, `read_file`, `write_file`) | 15+ (including diff/patch editing, glob, grep, web fetch, memory/notebook, multi-file editing) |
 | **Permissions** | Binary confirm/deny per tool call | Configurable allow-lists, regex patterns, auto-approval rules, per-project settings |
@@ -186,4 +186,4 @@ Mini-claude establishes a useful lower bound: this is the minimum viable agentic
 
 ---
 
-*749 lines. Two dependencies. One file. Everything else is Claude.*
+*~750 lines. Two dependencies. One file. Everything else is Claude.*
