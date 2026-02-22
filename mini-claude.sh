@@ -7,6 +7,9 @@ MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
 MAX_TOKENS=4096
 CONVERSATION='[]'
 
+SESSION_DIR="$HOME/.mini-claude/sessions"
+mkdir -p "$SESSION_DIR"
+
 # --- Check dependencies ---
 for cmd in curl jq; do
   command -v "$cmd" &>/dev/null || { echo "Error: $cmd is required but not installed." >&2; exit 1; }
@@ -42,6 +45,72 @@ else
   echo "Error: ANTHROPIC_API_KEY is not set and no Claude Code credentials found." >&2
   echo "Either: export ANTHROPIC_API_KEY=sk-ant-... or run 'claude login' first." >&2
   exit 1
+fi
+
+# --- Session management ---
+SESSION_FILE=""
+
+new_session() {
+  SESSION_FILE="$SESSION_DIR/$(date +%Y%m%d-%H%M%S).json"
+  CONVERSATION='[]'
+  printf '[]' > "$SESSION_FILE"
+  printf 'Started new session: %s\n' "$(basename "$SESSION_FILE")" >&2
+}
+
+save_session() {
+  [[ -n "$SESSION_FILE" ]] && printf '%s' "$CONVERSATION" > "$SESSION_FILE"
+}
+
+load_session() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    CONVERSATION=$(cat "$file")
+    SESSION_FILE="$file"
+    local turns
+    turns=$(printf '%s' "$CONVERSATION" | jq 'length')
+    printf 'Resumed session: %s (%s messages)\n' "$(basename "$file")" "$turns" >&2
+  else
+    printf 'Session file not found: %s\n' "$file" >&2
+  fi
+}
+
+list_sessions() {
+  local files=("$SESSION_DIR"/*.json)
+  if [[ ! -e "${files[0]}" ]]; then
+    printf 'No saved sessions.\n'
+    return
+  fi
+  printf '\nSaved sessions:\n'
+  local i=1
+  for f in "${files[@]}"; do
+    local turns
+    turns=$(jq 'length' "$f")
+    printf '  [%d] %s  (%s messages)\n' "$i" "$(basename "$f")" "$turns"
+    (( i++ ))
+  done
+  printf '\nEnter session number to resume, or press enter to start new: '
+  read -r choice < /dev/tty
+  if [[ -n "$choice" ]] && [[ "$choice" =~ ^[0-9]+$ ]]; then
+    local idx=$(( choice - 1 ))
+    load_session "${files[$idx]}"
+  else
+    new_session
+  fi
+}
+
+# --- On startup: offer to resume last session ---
+last_session=$(ls -t "$SESSION_DIR"/*.json 2>/dev/null | head -1 || true)
+if [[ -n "$last_session" ]]; then
+  turns=$(jq 'length' "$last_session")
+  printf 'Last session: %s (%s messages). Resume? [Y/n] ' "$(basename "$last_session")" "$turns"
+  read -r resume < /dev/tty
+  if [[ "${resume:-y}" =~ ^[Yy]$ ]]; then
+    load_session "$last_session"
+  else
+    new_session
+  fi
+else
+  new_session
 fi
 
 # --- Tool definitions sent to the API ---
@@ -159,17 +228,32 @@ add_message() {
     --arg role "$role" \
     --argjson content "$content" \
     '. + [{"role": $role, "content": $content}]')
+  save_session
 }
 
 # --- Main loop ---
 printf 'mini-claude — minimal agentic shell (model: %s)\n' "$MODEL"
-printf 'Type your message, or ctrl-c to quit.\n'
+printf 'Commands: /clear  /sessions  /quit\n'
 printf '%.0s─' {1..40}; printf '\n'
 
 while true; do
   printf '\nyou> '
   read -r user_input || { printf '\n'; exit 0; }
-  [[ -z "$user_input" ]] && continue
+
+  # Built-in slash commands
+  case "$user_input" in
+    /quit|/exit) exit 0 ;;
+    /clear)
+      new_session
+      printf 'Conversation cleared.\n'
+      continue
+      ;;
+    /sessions)
+      list_sessions
+      continue
+      ;;
+    '') continue ;;
+  esac
 
   add_message "user" "$(jq -n --arg t "$user_input" '[{"type":"text","text":$t}]')"
 
