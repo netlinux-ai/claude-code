@@ -6,9 +6,23 @@ API_URL="https://api.anthropic.com/v1/messages"
 MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
 MAX_TOKENS=4096
 CONVERSATION='[]'
+SKIP_PERMISSIONS=false
 
 SESSION_DIR="$HOME/.mini-claude/sessions"
 mkdir -p "$SESSION_DIR"
+
+# --- Parse flags ---
+for arg in "$@"; do
+  case "$arg" in
+    --dangerously-skip-permissions)
+      SKIP_PERMISSIONS=true
+      ;;
+    *)
+      printf 'Unknown argument: %s\n' "$arg" >&2
+      exit 1
+      ;;
+  esac
+done
 
 # --- Check dependencies ---
 for cmd in curl jq; do
@@ -160,8 +174,10 @@ execute_tool() {
       local cmd
       cmd=$(printf '%s' "$input" | jq -r '.command')
       printf '[tool] bash: %s\n' "$cmd" >&2
-      read -rp "Allow? [y/N] " confirm < /dev/tty
-      [[ "$confirm" == "y" ]] || { echo "Denied by user"; return; }
+      if [[ "$SKIP_PERMISSIONS" == false ]]; then
+        read -rp "Allow? [y/N] " confirm < /dev/tty
+        [[ "$confirm" == "y" ]] || { echo "Denied by user"; return; }
+      fi
       bash -c "$cmd" 2>&1 || true
       ;;
     read_file)
@@ -175,8 +191,10 @@ execute_tool() {
       path=$(printf '%s' "$input" | jq -r '.path')
       content=$(printf '%s' "$input" | jq -r '.content')
       printf '[tool] write: %s\n' "$path" >&2
-      read -rp "Allow write? [y/N] " confirm < /dev/tty
-      [[ "$confirm" == "y" ]] || { echo "Denied by user"; return; }
+      if [[ "$SKIP_PERMISSIONS" == false ]]; then
+        read -rp "Allow write? [y/N] " confirm < /dev/tty
+        [[ "$confirm" == "y" ]] || { echo "Denied by user"; return; }
+      fi
       mkdir -p "$(dirname "$path")"
       printf '%s' "$content" > "$path" && echo "OK" || echo "Error writing file"
       ;;
@@ -233,6 +251,9 @@ add_message() {
 
 # --- Main loop ---
 printf 'mini-claude — minimal agentic shell (model: %s)\n' "$MODEL"
+if [[ "$SKIP_PERMISSIONS" == true ]]; then
+  printf '\033[33m⚠  --dangerously-skip-permissions active: all tool calls run without confirmation\033[0m\n'
+fi
 printf 'Commands: /clear  /sessions  /quit\n'
 printf '%.0s─' {1..40}; printf '\n'
 
