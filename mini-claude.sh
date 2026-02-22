@@ -357,7 +357,9 @@ repair_session() {
     MSG_SEQ=0
   fi
 
-  [[ "$removed" -gt 0 ]] && printf 'Repaired session: removed %s orphaned messages.\n' "$removed" >&2
+  if [[ "$removed" -gt 0 ]]; then
+    printf 'Repaired session: removed %s orphaned messages.\n' "$removed" >&2
+  fi
 }
 
 # =============================================================================
