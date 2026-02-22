@@ -8,6 +8,9 @@ MAX_TOKENS=4096
 CONVERSATION='[]'
 SKIP_PERMISSIONS=false
 
+COMPACT_THRESHOLD=320000  # ~80k tokens at chars/4
+COMPACT_KEEP_LAST=10      # keep last N messages verbatim after compaction
+
 SESSION_DIR="$HOME/.mini-claude/sessions"
 mkdir -p "$SESSION_DIR"
 
@@ -80,11 +83,66 @@ load_session() {
   if [[ -f "$file" ]]; then
     CONVERSATION=$(cat "$file")
     SESSION_FILE="$file"
+    repair_conversation
     local turns
     turns=$(printf '%s' "$CONVERSATION" | jq 'length')
-    printf 'Resumed session: %s (%s messages)\n' "$(basename "$file")" "$turns" >&2
+    local compacted_file="${file%.json}.compacted.txt"
+    local compacted_note=""
+    [[ -f "$compacted_file" ]] && compacted_note=" [compacted]"
+    printf 'Resumed session: %s (%s messages%s)\n' "$(basename "$file")" "$turns" "$compacted_note" >&2
   else
     printf 'Session file not found: %s\n' "$file" >&2
+  fi
+}
+
+# --- Repair orphaned tool_use/tool_result pairs ---
+repair_conversation() {
+  local orig_len
+  orig_len=$(printf '%s' "$CONVERSATION" | jq 'length')
+
+  local repaired
+  repaired=$(printf '%s' "$CONVERSATION" | jq '
+    . as $arr | length as $len |
+    reduce range($len) as $i (
+      {out: [], skip: false};
+      if .skip then .skip = false
+      elif $arr[$i].role == "assistant" and
+           ([$arr[$i].content[] | objects | select(.type == "tool_use")] | length) > 0 then
+        ([$arr[$i].content[] | objects | select(.type == "tool_use") | .id]) as $needed |
+        if ($i + 1) < $len then
+          ([$arr[$i + 1].content[]? | objects | select(.type == "tool_result") | .tool_use_id]) as $have |
+          if ($needed | all(. as $id | $have | index($id))) then
+            .out += [$arr[$i]]
+          else
+            .skip = true
+          end
+        else .
+        end
+      else
+        .out += [$arr[$i]]
+      end
+    ) | .out
+  ')
+
+  # Also merge consecutive same-role messages (API requires alternating roles)
+  repaired=$(printf '%s' "$repaired" | jq '
+    reduce .[] as $msg (
+      [];
+      if length > 0 and .[-1].role == $msg.role then
+        .[-1].content += $msg.content
+      else
+        . + [$msg]
+      end
+    )
+  ')
+
+  local new_len
+  new_len=$(printf '%s' "$repaired" | jq 'length')
+
+  if [[ "$new_len" -lt "$orig_len" ]]; then
+    CONVERSATION="$repaired"
+    save_session
+    printf 'Repaired session: removed %s orphaned messages.\n' "$(( orig_len - new_len ))" >&2
   fi
 }
 
@@ -249,12 +307,157 @@ add_message() {
   save_session
 }
 
+# --- Token estimation ---
+estimate_tokens() {
+  local chars
+  chars=$(printf '%s' "$CONVERSATION" | wc -c)
+  echo $(( chars / 4 ))
+}
+
+# --- Compaction ---
+compact_conversation() {
+  local token_est
+  token_est=$(estimate_tokens)
+  local msg_count
+  msg_count=$(printf '%s' "$CONVERSATION" | jq 'length')
+
+  if [[ "$msg_count" -le "$COMPACT_KEEP_LAST" ]]; then
+    printf 'Conversation too short to compact (%s messages).\n' "$msg_count" >&2
+    return
+  fi
+
+  printf '\033[33mCompacting conversation (~%sk tokens, %s messages)...\033[0m\n' \
+    "$(( token_est / 1000 ))" "$msg_count" >&2
+
+  # Find a clean split point — never split inside a tool_use/tool_result exchange.
+  # Start near (length - COMPACT_KEEP_LAST) and scan forward to find a user message
+  # with plain text (not tool_results), which is a safe boundary.
+  local split_idx
+  split_idx=$(printf '%s' "$CONVERSATION" | jq --argjson n "$COMPACT_KEEP_LAST" '
+    . as $arr | length as $len |
+    ([$len - $n, 2] | max) as $start |
+    first(
+      range($start; $len) |
+      select(
+        $arr[.].role == "user" and
+        ([$arr[.].content[]? | objects | select(.type == "tool_result")] | length) == 0
+      )
+    ) // $start
+  ')
+
+  local older recent
+  older=$(printf '%s' "$CONVERSATION" | jq --argjson i "$split_idx" '.[:$i]')
+  recent=$(printf '%s' "$CONVERSATION" | jq --argjson i "$split_idx" '.[$i:]')
+
+  # Build a summarization request with the older messages
+  local summary_payload
+  summary_payload=$(jq -n \
+    --argjson older "$older" \
+    --arg model "$MODEL" \
+    '{
+      model: $model,
+      max_tokens: 4096,
+      messages: [
+        {
+          role: "user",
+          content: ([{
+            type: "text",
+            text: "Below is a conversation between a user and an AI assistant. Produce a concise summary that captures: (1) what tasks were worked on, (2) key decisions and outcomes, (3) any important file paths, commands, or code discussed, (4) current state of any ongoing work. Be factual and specific — this summary will replace the conversation history.\n\nConversation:\n"
+          }] + [
+            $older[] |
+            {type: "text", text: ((.role) + ": " + (
+              if .content | type == "array" then
+                [.content[] | select(.type == "text") | .text] | join("\n")
+              else
+                .content | tostring
+              end
+            ) + "\n")}
+          ] + [{
+            type: "text",
+            text: "\n---\nProduce the summary now. Be concise but preserve all important details."
+          }])
+        }
+      ]
+    }')
+
+  local tmpfile
+  tmpfile=$(mktemp)
+  trap "rm -f '$tmpfile'" RETURN
+
+  local -a curl_args=(
+    -s -o "$tmpfile" -w "%{http_code}" "$API_URL"
+    -H "$AUTH_HEADER"
+    -H "anthropic-version: 2023-06-01"
+    -H "content-type: application/json"
+  )
+  [[ -n "${OAUTH_BETA:-}" ]] && curl_args+=(-H "anthropic-beta: $OAUTH_BETA")
+
+  local http_code
+  http_code=$(printf '%s' "$summary_payload" | curl "${curl_args[@]}" -d @-)
+
+  if [[ "$http_code" -ne 200 ]]; then
+    printf 'Compaction failed (HTTP %s):\n' "$http_code" >&2
+    cat "$tmpfile" >&2
+    printf '\n' >&2
+    return 1
+  fi
+
+  local summary
+  summary=$(jq -r '.content[] | select(.type=="text") | .text' "$tmpfile")
+
+  if [[ -z "$summary" ]]; then
+    printf 'Compaction failed: empty summary returned.\n' >&2
+    return 1
+  fi
+
+  # Rebuild conversation: synthetic summary pair + recent messages
+  local summary_user summary_assistant
+  summary_user=$(jq -n --arg s "[This conversation was compacted. Summary of prior context follows.]" \
+    '[{"type":"text","text":$s}]')
+  summary_assistant=$(jq -n --arg s "$summary" \
+    '[{"type":"text","text":$s}]')
+
+  CONVERSATION=$(jq -n \
+    --argjson su "$summary_user" \
+    --argjson sa "$summary_assistant" \
+    --argjson recent "$recent" \
+    '[{"role":"user","content":$su},{"role":"assistant","content":$sa}] + $recent')
+
+  # Safety net: repair any orphaned tool_use in the kept recent messages
+  repair_conversation
+  save_session
+
+  # Save summary alongside session for reference
+  if [[ -n "$SESSION_FILE" ]]; then
+    local summary_file="${SESSION_FILE%.json}.compacted.txt"
+    printf 'Compacted at %s (~%sk tokens → ~%sk tokens)\n\n%s\n' \
+      "$(date)" "$(( token_est / 1000 ))" "$(( $(estimate_tokens) / 1000 ))" \
+      "$summary" >> "$summary_file"
+  fi
+
+  local new_token_est
+  new_token_est=$(estimate_tokens)
+  local new_msg_count
+  new_msg_count=$(printf '%s' "$CONVERSATION" | jq 'length')
+  printf '\033[32mCompacted: %s messages → %s (~%sk tokens → ~%sk tokens)\033[0m\n' \
+    "$msg_count" "$new_msg_count" "$(( token_est / 1000 ))" "$(( new_token_est / 1000 ))" >&2
+}
+
+# --- Auto-compact check ---
+check_auto_compact() {
+  local chars
+  chars=$(printf '%s' "$CONVERSATION" | wc -c)
+  if [[ "$chars" -gt "$COMPACT_THRESHOLD" ]]; then
+    compact_conversation
+  fi
+}
+
 # --- Main loop ---
 printf 'mini-claude — minimal agentic shell (model: %s)\n' "$MODEL"
 if [[ "$SKIP_PERMISSIONS" == true ]]; then
   printf '\033[33m⚠  --dangerously-skip-permissions active: all tool calls run without confirmation\033[0m\n'
 fi
-printf 'Commands: /clear  /sessions  /quit\n'
+printf 'Commands: /clear  /compact  /sessions  /quit\n'
 printf '%.0s─' {1..40}; printf '\n'
 
 while true; do
@@ -267,6 +470,10 @@ while true; do
     /clear)
       new_session
       printf 'Conversation cleared.\n'
+      continue
+      ;;
+    /compact)
+      compact_conversation
       continue
       ;;
     /sessions)
@@ -290,14 +497,30 @@ while true; do
     stop_reason=$(printf '%s' "$response" | jq -r '.stop_reason')
     content=$(printf '%s' "$response" | jq -c '.content')
 
+    # Check if content actually has tool_use blocks
+    has_tool_use=$(printf '%s' "$content" | jq '[.[] | select(.type=="tool_use")] | length')
+
+    # If stop_reason isn't "tool_use" but content has tool_use blocks,
+    # strip them — they're truncated/invalid (e.g. from max_tokens cutoff)
+    if [[ "$stop_reason" != "tool_use" ]] && [[ "$has_tool_use" -gt 0 ]]; then
+      printf '\033[33m(stripped %s orphaned tool_use blocks from truncated response)\033[0m\n' "$has_tool_use" >&2
+      content=$(printf '%s' "$content" | jq -c '[.[] | select(.type != "tool_use")]')
+      has_tool_use=0
+    fi
+
     # Print any text blocks
     printf '%s' "$content" | jq -r '.[] | select(.type=="text") | .text'
 
     # Add assistant response to conversation
     add_message "assistant" "$content"
 
-    # If no tool use, break back to user input
-    [[ "$stop_reason" != "tool_use" ]] && break
+    # If no tool use, show token count and break back to user input
+    if [[ "$has_tool_use" -eq 0 ]]; then
+      tok_est=$(estimate_tokens)
+      printf '\033[2m[~%sk tokens]\033[0m\n' "$(( tok_est / 1000 ))" >&2
+      check_auto_compact
+      break
+    fi
 
     # Process each tool call, collect results
     tool_results='[]'
