@@ -3,7 +3,7 @@ set -euo pipefail
 
 # --- Config ---
 API_URL="https://api.anthropic.com/v1/messages"
-MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
+MODEL="${CLAUDE_MODEL:-claude-opus-4-6}"
 MAX_TOKENS=16384
 SKIP_PERMISSIONS=false
 
