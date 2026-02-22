@@ -209,60 +209,61 @@ add_tool_results() {
 # =============================================================================
 
 build_payload() {
-  local messages='[]'
+  # Write one JSON file per message into a temp dir, then jq -s merge.
+  # No large strings ever live in a shell variable.
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  trap "rm -rf '$tmpdir'" RETURN
 
+  local seq=0
   while IFS= read -r msg_dir; do
     [[ -z "$msg_dir" ]] && continue
-    local base role
+    local base role outfile
     base=$(basename "$msg_dir")
-    role="${base#*-}"  # user or assistant
+    role="${base#*-}"
+    outfile=$(printf '%s/%05d.json' "$tmpdir" "$seq")
+    seq=$(( seq + 1 ))
 
     if [[ "$role" == "user" ]]; then
-      local content='[]'
-
-      # Text content
-      if [[ -f "$msg_dir/text.md" ]]; then
-        content=$(jq -n --rawfile t "$msg_dir/text.md" '[{"type":"text","text":$t}]')
-      fi
-
-      # Tool results
       if [[ -f "$msg_dir/tool_result.json" ]]; then
-        content=$(cat "$msg_dir/tool_result.json")
+        jq -n --arg role "$role" --slurpfile c "$msg_dir/tool_result.json" \
+          '{role:$role, content:$c[0]}' > "$outfile"
+      elif [[ -f "$msg_dir/text.md" ]]; then
+        jq -n --arg role "$role" --rawfile t "$msg_dir/text.md" \
+          '{role:$role, content:[{type:"text",text:$t}]}' > "$outfile"
       fi
-
-      messages=$(printf '%s' "$messages" | jq \
-        --arg role "$role" \
-        --argjson content "$content" \
-        '. + [{"role":$role,"content":$content}]')
 
     elif [[ "$role" == "assistant" ]]; then
       local content='[]'
-
-      # Text content
       if [[ -f "$msg_dir/text.md" ]]; then
-        content=$(jq -n --rawfile t "$msg_dir/text.md" '[{"type":"text","text":$t}]')
+        content=$(jq -n --rawfile t "$msg_dir/text.md" '[{type:"text",text:$t}]')
       fi
-
-      # Tool use blocks
       if [[ -f "$msg_dir/tool_use.json" ]]; then
-        local tool_uses
-        tool_uses=$(cat "$msg_dir/tool_use.json")
-        content=$(printf '%s' "$content" | jq --argjson tu "$tool_uses" '. + $tu')
+        content=$(printf '%s' "$content" | jq --slurpfile tu "$msg_dir/tool_use.json" '. + $tu[0]')
       fi
-
-      messages=$(printf '%s' "$messages" | jq \
-        --arg role "$role" \
-        --argjson content "$content" \
-        '. + [{"role":$role,"content":$content}]')
+      printf '%s' "$content" | jq --arg role "$role" '{role:$role, content:.}' > "$outfile"
     fi
   done < <(msg_dirs)
 
-  jq -n \
-    --argjson messages "$messages" \
-    --argjson tools "$TOOLS" \
-    --arg model "$MODEL" \
-    --argjson max_tokens "$MAX_TOKENS" \
-    '{model: $model, max_tokens: $max_tokens, tools: $tools, messages: $messages}'
+  # Merge all per-message files into the final payload
+  local payload_file="$SESSION_DIR/.last_payload.json"
+  if compgen -G "$tmpdir/*.json" > /dev/null; then
+    jq -n \
+      --slurpfile msgs <(jq -s '.' "$tmpdir"/*.json) \
+      --argjson tools "$TOOLS" \
+      --arg model "$MODEL" \
+      --argjson max_tokens "$MAX_TOKENS" \
+      '{model:$model, max_tokens:$max_tokens, tools:$tools, messages:$msgs[0]}' \
+      > "$payload_file"
+  else
+    jq -n \
+      --argjson tools "$TOOLS" \
+      --arg model "$MODEL" \
+      --argjson max_tokens "$MAX_TOKENS" \
+      '{model:$model, max_tokens:$max_tokens, tools:$tools, messages:[]}' \
+      > "$payload_file"
+  fi
+  echo "$payload_file"
 }
 
 # =============================================================================
@@ -413,22 +414,25 @@ compact_conversation() {
     fi
   done
 
-  # Build text summary of older messages for the summarization prompt
-  local summary_text=""
+  # Build text summary of older messages — append to temp file, not shell var
+  local conv_file
+  conv_file=$(mktemp)
   for (( idx=0; idx < split_idx; idx++ )); do
     local d="${all_dirs[$idx]}"
     local role
     role=$(basename "$d" | cut -d- -f2-)
     if [[ -f "$d/text.md" ]]; then
-      summary_text+="$role: $(cat "$d/text.md")"$'\n'
+      printf '%s: ' "$role" >> "$conv_file"
+      cat "$d/text.md" >> "$conv_file"
+      printf '\n' >> "$conv_file"
     fi
   done
 
-  # Call API to summarize
-  local summary_payload
-  summary_payload=$(jq -n \
+  # Call API to summarize — payload and response go through files
+  local compact_payload="$SESSION_DIR/.compact_payload.json"
+  jq -n \
     --arg model "$MODEL" \
-    --arg conv "$summary_text" \
+    --rawfile conv "$conv_file" \
     '{
       model: $model,
       max_tokens: 4096,
@@ -436,14 +440,12 @@ compact_conversation() {
         role: "user",
         content: ("Below is a conversation between a user and an AI assistant. Produce a concise summary that captures: (1) what tasks were worked on, (2) key decisions and outcomes, (3) any important file paths, commands, or code discussed, (4) current state of any ongoing work. Be factual and specific — this summary will replace the conversation history.\n\nConversation:\n" + $conv + "\n---\nProduce the summary now. Be concise but preserve all important details.")
       }]
-    }')
+    }' > "$compact_payload"
+  rm -f "$conv_file"
 
-  local tmpfile
-  tmpfile=$(mktemp)
-  trap "rm -f '$tmpfile'" RETURN
-
+  local compact_response="$SESSION_DIR/.compact_response.json"
   local -a curl_args=(
-    -s -o "$tmpfile" -w "%{http_code}" "$API_URL"
+    -s -o "$compact_response" -w "%{http_code}" "$API_URL"
     -H "$AUTH_HEADER"
     -H "anthropic-version: 2023-06-01"
     -H "content-type: application/json"
@@ -451,17 +453,17 @@ compact_conversation() {
   [[ -n "${OAUTH_BETA:-}" ]] && curl_args+=(-H "anthropic-beta: $OAUTH_BETA")
 
   local http_code
-  http_code=$(printf '%s' "$summary_payload" | curl "${curl_args[@]}" -d @-)
+  http_code=$(curl "${curl_args[@]}" -d "@$compact_payload")
 
   if [[ "$http_code" -ne 200 ]]; then
     printf 'Compaction failed (HTTP %s):\n' "$http_code" >&2
-    cat "$tmpfile" >&2
+    cat "$compact_response" >&2
     printf '\n' >&2
     return 1
   fi
 
   local summary
-  summary=$(jq -r '.content[] | select(.type=="text") | .text' "$tmpfile")
+  summary=$(jq -r '.content[] | select(.type=="text") | .text' "$compact_response")
 
   if [[ -z "$summary" ]]; then
     printf 'Compaction failed: empty summary returned.\n' >&2
@@ -601,32 +603,30 @@ execute_tool() {
 # =============================================================================
 
 call_api() {
-  local payload
-  payload=$(build_payload)
+  local payload_file
+  payload_file=$(build_payload)
 
-  local tmpfile
-  tmpfile=$(mktemp)
-  trap "rm -f '$tmpfile'" RETURN
+  local response_file="$SESSION_DIR/.last_response.json"
 
   local http_code
   local -a curl_args=(
-    -s -o "$tmpfile" -w "%{http_code}" "$API_URL"
+    -s -o "$response_file" -w "%{http_code}" "$API_URL"
     -H "$AUTH_HEADER"
     -H "anthropic-version: 2023-06-01"
     -H "content-type: application/json"
   )
   [[ -n "${OAUTH_BETA:-}" ]] && curl_args+=(-H "anthropic-beta: $OAUTH_BETA")
 
-  http_code=$(printf '%s' "$payload" | curl "${curl_args[@]}" -d @-)
+  http_code=$(curl "${curl_args[@]}" -d "@$payload_file")
 
   if [[ "$http_code" -ne 200 ]]; then
     printf 'API error (HTTP %s):\n' "$http_code" >&2
-    cat "$tmpfile" >&2
+    cat "$response_file" >&2
     printf '\n' >&2
     return 1
   fi
 
-  cat "$tmpfile"
+  cat "$response_file"
 }
 
 # =============================================================================
@@ -719,8 +719,10 @@ while true; do
       break
     fi
 
-    # Process tool calls
-    tool_results='[]'
+    # Process tool calls — write each result to a temp file, then merge
+    local results_dir
+    results_dir=$(mktemp -d)
+    local tool_seq=0
     while IFS= read -r row; do
       tool_id=$(printf '%s' "$row" | jq -r '.id')
       tool_name=$(printf '%s' "$row" | jq -r '.name')
@@ -732,13 +734,16 @@ while true; do
         result="${result:0:30000}... [truncated]"
       fi
 
-      tool_results=$(printf '%s' "$tool_results" | jq \
-        --arg id "$tool_id" \
-        --arg result "$result" \
-        '. + [{"type":"tool_result","tool_use_id":$id,"content":$result}]')
+      jq -n --arg id "$tool_id" --arg result "$result" \
+        '{type:"tool_result", tool_use_id:$id, content:$result}' \
+        > "$results_dir/$(printf '%03d' "$tool_seq").json"
+      tool_seq=$(( tool_seq + 1 ))
     done < <(printf '%s' "$content" | jq -c '.[] | select(.type=="tool_use")')
 
-    # Save tool results to disk
-    add_tool_results "$tool_results"
+    # Merge all results into a single array and save
+    local merged_results
+    merged_results=$(jq -s '.' "$results_dir"/*.json)
+    rm -rf "$results_dir"
+    add_tool_results "$merged_results"
   done
 done
