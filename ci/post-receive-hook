@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# post-receive hook — runs mini-claude CI on pushes to main/master
+# Symlink into a bare repo's hooks/ directory to enable.
+set -euo pipefail
+
+MINI_CLAUDE="/usr/local/bin/mini-claude"
+CI_ROOT="/mnt/projects/ci"
+LOCKFILE="/tmp/mini-claude-ci.lock"
+CLAUDE_MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
+DIFF_LIMIT=20000
+
+# --- Read post-receive stdin: oldrev newrev refname ---
+# Collect all refs; we only act on main/master
+TARGET_REF=""
+OLDREV=""
+NEWREV=""
+while read -r old new ref; do
+  case "$ref" in
+    refs/heads/main|refs/heads/master)
+      TARGET_REF="$ref"
+      OLDREV="$old"
+      NEWREV="$new"
+      ;;
+  esac
+done
+
+# Nothing to do if no push to main/master
+if [[ -z "$TARGET_REF" ]]; then
+  exit 0
+fi
+
+BRANCH="${TARGET_REF#refs/heads/}"
+
+# Derive repo path from GIT_DIR (set by git when running hooks)
+# Fallback: PWD (git also cd's into the repo dir when running hooks)
+if [[ -n "${GIT_DIR:-}" ]]; then
+  REPO_DIR="$(cd "$GIT_DIR" && pwd)"
+else
+  REPO_DIR="$(pwd)"
+fi
+REPO_NAME="$(basename "$REPO_DIR" .git)"
+
+# --- Run the CI job in the background so the push returns quickly ---
+(
+  # Unset GIT_DIR/GIT_WORK_TREE — git sets these when running hooks,
+  # but they break git commands after we cd to the temp clone
+  unset GIT_DIR GIT_WORK_TREE
+
+  exec >/dev/null 2>&1
+  # Lockfile — one CI run at a time on this low-memory server
+  exec 9>"$LOCKFILE"
+  if ! flock -n 9; then
+    echo "mini-claude CI: another run in progress, skipping $REPO_NAME" >> "$CI_ROOT/skipped.log"
+    exit 0
+  fi
+
+  WORKDIR=$(mktemp -d "/tmp/mini-claude-ci-${REPO_NAME}.XXXXXX")
+  cleanup() { rm -rf "$WORKDIR"; }
+  trap cleanup EXIT
+
+  # Shallow clone the repo
+  git clone --depth 1 --branch "$BRANCH" "file://$REPO_DIR" "$WORKDIR/repo" 2>/dev/null || {
+    echo "Failed to clone $REPO_DIR" >> "$CI_ROOT/error.log"
+    exit 1
+  }
+
+  cd "$WORKDIR/repo"
+
+  # Fetch enough history to compute the diff
+  # For a zero (initial) oldrev, just show the latest commit
+  ZERO="0000000000000000000000000000000000000000"
+  if [[ "$OLDREV" == "$ZERO" ]]; then
+    COMMIT_LOG=$(git log -1 --oneline)
+    DIFF_STAT=$(git show --stat --format= HEAD)
+    DIFF=$(git show --format= HEAD | head -c "$DIFF_LIMIT")
+  else
+    git fetch --depth=50 origin "$BRANCH" 2>/dev/null || true
+    COMMIT_LOG=$(git log --oneline "${OLDREV}..${NEWREV}" 2>/dev/null || git log -5 --oneline)
+    DIFF_STAT=$(git diff --stat "${OLDREV}" "${NEWREV}" 2>/dev/null || git show --stat --format= HEAD)
+    DIFF=$(git diff "${OLDREV}" "${NEWREV}" 2>/dev/null || git show --format= HEAD)
+    if [[ "${#DIFF}" -gt "$DIFF_LIMIT" ]]; then
+      DIFF="${DIFF:0:$DIFF_LIMIT}
+... [diff truncated at ${DIFF_LIMIT} chars]"
+    fi
+  fi
+
+  # Detect test infrastructure
+  TEST_INSTRUCTIONS=""
+  if [[ -f Makefile ]] && grep -q '^test:' Makefile 2>/dev/null; then
+    TEST_INSTRUCTIONS="This project has a Makefile with a 'test' target. Run 'make test' to check for regressions."
+  elif [[ -f pytest.ini ]] || [[ -f setup.py ]] || [[ -f pyproject.toml ]]; then
+    if command -v pytest &>/dev/null; then
+      TEST_INSTRUCTIONS="This is a Python project. Run 'pytest' if tests exist."
+    fi
+  elif [[ -f package.json ]] && grep -q '"test"' package.json 2>/dev/null; then
+    TEST_INSTRUCTIONS="This is a Node.js project with a test script. Run 'npm test' to check for regressions."
+  elif [[ -f Cargo.toml ]]; then
+    TEST_INSTRUCTIONS="This is a Rust project. Run 'cargo test' if tests exist."
+  fi
+
+  # Build the prompt
+  PROMPT="You are a CI/CD assistant analyzing a git push to the ${REPO_NAME} repository.
+
+## Push details
+- Repository: ${REPO_NAME}
+- Branch: ${BRANCH}
+- Commits:
+${COMMIT_LOG}
+
+## Diff summary
+${DIFF_STAT}
+
+## Full diff
+\`\`\`
+${DIFF}
+\`\`\`
+
+## Your task
+1. Briefly summarize what changed in this push (2-3 sentences)
+2. Review the code changes for bugs, security issues, or style problems
+3. Note anything that looks risky or could break
+${TEST_INSTRUCTIONS:+4. ${TEST_INSTRUCTIONS}}
+
+Keep your response concise and actionable. Focus on what matters."
+
+  # Prepare output directory
+  REPO_CI_DIR="$CI_ROOT/$REPO_NAME"
+  mkdir -p "$REPO_CI_DIR"
+  OUTPUT_FILE="$REPO_CI_DIR/latest.log"
+
+  # Write header
+  {
+    printf '=%.0s' {1..60}; printf '\n'
+    printf 'mini-claude CI — %s @ %s\n' "$REPO_NAME" "$(date)"
+    printf 'Branch: %s  Commits: %s..%s\n' "$BRANCH" "${OLDREV:0:8}" "${NEWREV:0:8}"
+    printf '=%.0s' {1..60}; printf '\n\n'
+  } > "$OUTPUT_FILE"
+
+  # Run mini-claude
+  RESPONSE_FILE="$WORKDIR/response.txt"
+  export CLAUDE_MODEL
+  export MINI_CLAUDE_SESSIONS="/var/lib/mini-claude/sessions"
+  mkdir -p "$MINI_CLAUDE_SESSIONS"
+
+  "$MINI_CLAUDE" --prompt "$PROMPT" --output-file "$RESPONSE_FILE" 2>>"$REPO_CI_DIR/stderr.log" || true
+
+  # Append response to log
+  if [[ -f "$RESPONSE_FILE" ]]; then
+    cat "$RESPONSE_FILE" >> "$OUTPUT_FILE"
+  else
+    printf '(no response from mini-claude)\n' >> "$OUTPUT_FILE"
+  fi
+
+  printf '\n---\nCompleted: %s\n' "$(date)" >> "$OUTPUT_FILE"
+
+  # Also keep a timestamped archive
+  cp "$OUTPUT_FILE" "$REPO_CI_DIR/$(date +%Y%m%d-%H%M%S).log"
+) &
+
+exit 0

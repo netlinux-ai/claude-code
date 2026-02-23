@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Enable mini-claude CI on a bare git repository
+# Usage: mini-claude-enable <repo.git>
+#        mini-claude-enable MTD.git
+set -euo pipefail
+
+HOOK_SOURCE="/usr/local/lib/mini-claude/post-receive-hook"
+GIT_ROOT="/mnt/projects/git"
+
+if [[ $# -ne 1 ]]; then
+  printf 'Usage: %s <repo.git>\n' "$(basename "$0")" >&2
+  printf 'Example: %s MTD.git\n' "$(basename "$0")" >&2
+  exit 1
+fi
+
+REPO="$1"
+# Ensure .git suffix
+[[ "$REPO" == *.git ]] || REPO="${REPO}.git"
+
+REPO_PATH="$GIT_ROOT/$REPO"
+
+if [[ ! -d "$REPO_PATH" ]]; then
+  printf 'Error: repository not found: %s\n' "$REPO_PATH" >&2
+  exit 1
+fi
+
+if [[ ! -f "$HOOK_SOURCE" ]]; then
+  printf 'Error: hook not found at %s\n' "$HOOK_SOURCE" >&2
+  printf 'Deploy mini-claude CI first (copy post-receive-hook to %s)\n' "$HOOK_SOURCE" >&2
+  exit 1
+fi
+
+HOOKS_DIR="$REPO_PATH/hooks"
+mkdir -p "$HOOKS_DIR"
+
+if [[ -f "$HOOKS_DIR/post-receive" ]] && [[ ! -L "$HOOKS_DIR/post-receive" ]]; then
+  printf 'Warning: %s/post-receive already exists and is not a symlink.\n' "$HOOKS_DIR" >&2
+  printf 'Back it up and remove it first, or manually add the mini-claude call.\n' >&2
+  exit 1
+fi
+
+ln -sf "$HOOK_SOURCE" "$HOOKS_DIR/post-receive"
+printf 'Enabled mini-claude CI on %s\n' "$REPO"
+printf 'Hook: %s -> %s\n' "$HOOKS_DIR/post-receive" "$HOOK_SOURCE"

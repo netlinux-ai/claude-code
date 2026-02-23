@@ -6,24 +6,42 @@ API_URL="https://api.anthropic.com/v1/messages"
 MODEL="${CLAUDE_MODEL:-claude-opus-4-6}"
 MAX_TOKENS=16384
 SKIP_PERMISSIONS=false
+PROMPT_TEXT=""
+NEW_SESSION=false
+OUTPUT_FILE=""
 
 COMPACT_THRESHOLD=320000  # ~80k tokens at chars/4
 COMPACT_KEEP_LAST=10      # keep last N messages verbatim after compaction
 
-SESSIONS_ROOT="$HOME/.mini-claude/sessions"
+SESSIONS_ROOT="${MINI_CLAUDE_SESSIONS:-$HOME/.mini-claude/sessions}"
 mkdir -p "$SESSIONS_ROOT"
 
 SESSION_DIR=""  # current session directory (e.g. sessions/20250222-120000/)
 MSG_SEQ=0       # next message sequence number
 
 # --- Parse flags ---
-for arg in "$@"; do
-  case "$arg" in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --dangerously-skip-permissions)
       SKIP_PERMISSIONS=true
+      shift
+      ;;
+    --prompt)
+      PROMPT_TEXT="$2"
+      SKIP_PERMISSIONS=true
+      NEW_SESSION=true
+      shift 2
+      ;;
+    --new-session)
+      NEW_SESSION=true
+      shift
+      ;;
+    --output-file)
+      OUTPUT_FILE="$2"
+      shift 2
       ;;
     *)
-      printf 'Unknown argument: %s\n' "$arg" >&2
+      printf 'Unknown argument: %s\n' "$1" >&2
       exit 1
       ;;
   esac
@@ -74,7 +92,60 @@ TOOLS='[
 
 # --- Resolve API key: env var > Claude Code OAuth credentials ---
 CREDENTIALS_FILE="$HOME/.claude/.credentials.json"
+OAUTH_TOKEN_URL="https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 AUTH_HEADER=""
+
+# Refresh OAuth token using refresh_token grant, update credentials file
+refresh_oauth_token() {
+  local refresh_token
+  refresh_token=$(jq -r '.claudeAiOauth.refreshToken // empty' "$CREDENTIALS_FILE")
+  if [[ -z "$refresh_token" ]]; then
+    printf 'Error: No refresh token in %s. Run "claude login" to re-authenticate.\n' "$CREDENTIALS_FILE" >&2
+    return 1
+  fi
+
+  printf 'OAuth token expired, refreshing...\n' >&2
+  local resp_file
+  resp_file=$(mktemp)
+  local http_code
+  http_code=$(curl -s -o "$resp_file" -w "%{http_code}" -X POST "$OAUTH_TOKEN_URL" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=refresh_token" \
+    -d "client_id=$OAUTH_CLIENT_ID" \
+    -d "refresh_token=$refresh_token")
+
+  if [[ "$http_code" -ne 200 ]]; then
+    printf 'OAuth refresh failed (HTTP %s): %s\n' "$http_code" "$(cat "$resp_file")" >&2
+    rm -f "$resp_file"
+    return 1
+  fi
+
+  local new_access new_refresh expires_in
+  new_access=$(jq -r '.access_token // empty' "$resp_file")
+  new_refresh=$(jq -r '.refresh_token // empty' "$resp_file")
+  expires_in=$(jq -r '.expires_in // 0' "$resp_file")
+  rm -f "$resp_file"
+
+  if [[ -z "$new_access" ]]; then
+    printf 'OAuth refresh returned empty access token.\n' >&2
+    return 1
+  fi
+
+  # Update credentials file with new tokens
+  local new_expires_at=$(( ($(date +%s) + expires_in) * 1000 ))
+  local tmp_creds
+  tmp_creds=$(mktemp)
+  jq --arg at "$new_access" \
+     --arg rt "${new_refresh:-$refresh_token}" \
+     --argjson exp "$new_expires_at" \
+     '.claudeAiOauth.accessToken = $at | .claudeAiOauth.refreshToken = $rt | .claudeAiOauth.expiresAt = $exp' \
+     "$CREDENTIALS_FILE" > "$tmp_creds" && mv "$tmp_creds" "$CREDENTIALS_FILE"
+
+  printf 'OAuth token refreshed (expires in %ss)\n' "$expires_in" >&2
+  # Set the variables for the caller
+  oauth_token="$new_access"
+}
 
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
   AUTH_HEADER="x-api-key: $ANTHROPIC_API_KEY"
@@ -86,9 +157,12 @@ elif [[ -f "$CREDENTIALS_FILE" ]]; then
   fi
   expires_at=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CREDENTIALS_FILE")
   now_ms=$(($(date +%s) * 1000))
-  if [[ "$now_ms" -gt "$expires_at" ]]; then
-    printf 'Warning: Claude Code OAuth token has expired. Run "claude" to refresh it.\n' >&2
-    exit 1
+  # Refresh if expired or within 5 minutes of expiry
+  if [[ "$now_ms" -gt $(( expires_at - 300000 )) ]]; then
+    if ! refresh_oauth_token; then
+      printf 'Error: OAuth token expired and refresh failed. Run "claude login" to re-authenticate.\n' >&2
+      exit 1
+    fi
   fi
   sub_type=$(jq -r '.claudeAiOauth.subscriptionType // "unknown"' "$CREDENTIALS_FILE")
   printf 'Using Claude Code OAuth credentials (%s subscription)\n' "$sub_type"
@@ -229,14 +303,14 @@ build_payload() {
         jq -n --arg role "$role" --slurpfile c "$msg_dir/tool_result.json" \
           '{role:$role, content:$c[0]}' > "$outfile"
       elif [[ -f "$msg_dir/text.md" ]]; then
-        jq -n --arg role "$role" --rawfile t "$msg_dir/text.md" \
+        jq -n --arg role "$role" --argjson t "$(jq -Rs '.' "$msg_dir/text.md")" \
           '{role:$role, content:[{type:"text",text:$t}]}' > "$outfile"
       fi
 
     elif [[ "$role" == "assistant" ]]; then
       local content='[]'
       if [[ -f "$msg_dir/text.md" ]]; then
-        content=$(jq -n --rawfile t "$msg_dir/text.md" '[{type:"text",text:$t}]')
+        content=$(jq -n --argjson t "$(jq -Rs '.' "$msg_dir/text.md")" '[{type:"text",text:$t}]')
       fi
       if [[ -f "$msg_dir/tool_use.json" ]]; then
         content=$(printf '%s' "$content" | jq --slurpfile tu "$msg_dir/tool_use.json" '. + $tu[0]')
@@ -434,7 +508,7 @@ compact_conversation() {
   local compact_payload="$SESSION_DIR/.compact_payload.json"
   jq -n \
     --arg model "$MODEL" \
-    --rawfile conv "$conv_file" \
+    --argjson conv "$(jq -Rs '.' "$conv_file")" \
     '{
       model: $model,
       max_tokens: 4096,
@@ -635,18 +709,22 @@ call_api() {
 # STARTUP — offer to resume last session
 # =============================================================================
 
-last_session=$(ls -dt "$SESSIONS_ROOT"/*/ 2>/dev/null | head -1 || true)
-if [[ -n "$last_session" ]] && [[ -d "$last_session" ]]; then
-  count=$(msg_count "$last_session")
-  printf 'Last session: %s (%s messages). Resume? [Y/n] ' "$(basename "$last_session")" "$count"
-  read -r resume < /dev/tty
-  if [[ "${resume:-y}" =~ ^[Yy]$ ]]; then
-    load_session "$last_session"
+if [[ "$NEW_SESSION" == true ]]; then
+  new_session
+else
+  last_session=$(ls -dt "$SESSIONS_ROOT"/*/ 2>/dev/null | head -1 || true)
+  if [[ -n "$last_session" ]] && [[ -d "$last_session" ]]; then
+    count=$(msg_count "$last_session")
+    printf 'Last session: %s (%s messages). Resume? [Y/n] ' "$(basename "$last_session")" "$count"
+    read -r resume < /dev/tty
+    if [[ "${resume:-y}" =~ ^[Yy]$ ]]; then
+      load_session "$last_session"
+    else
+      new_session
+    fi
   else
     new_session
   fi
-else
-  new_session
 fi
 
 # =============================================================================
@@ -657,31 +735,41 @@ printf 'mini-claude — minimal agentic shell (model: %s)\n' "$MODEL"
 if [[ "$SKIP_PERMISSIONS" == true ]]; then
   printf '\033[33m⚠  --dangerously-skip-permissions active: all tool calls run without confirmation\033[0m\n'
 fi
-printf 'Commands: /clear  /compact  /sessions  /quit\n'
-printf '%.0s─' {1..40}; printf '\n'
+if [[ -z "$PROMPT_TEXT" ]]; then
+  printf 'Commands: /clear  /compact  /sessions  /quit\n'
+  printf '%.0s─' {1..40}; printf '\n'
+fi
+
+LAST_ASSISTANT_TEXT=""
 
 while true; do
-  printf '\nyou> '
-  read -r user_input || { printf '\n'; exit 0; }
+  if [[ -n "$PROMPT_TEXT" ]]; then
+    user_input="$PROMPT_TEXT"
+  else
+    printf '\nyou> '
+    read -r user_input || { printf '\n'; exit 0; }
+  fi
 
-  # Built-in slash commands
-  case "$user_input" in
-    /quit|/exit) exit 0 ;;
-    /clear)
-      new_session
-      printf 'Conversation cleared.\n'
-      continue
-      ;;
-    /compact)
-      compact_conversation
-      continue
-      ;;
-    /sessions)
-      list_sessions
-      continue
-      ;;
-    '') continue ;;
-  esac
+  # Built-in slash commands (only in interactive mode)
+  if [[ -z "$PROMPT_TEXT" ]]; then
+    case "$user_input" in
+      /quit|/exit) exit 0 ;;
+      /clear)
+        new_session
+        printf 'Conversation cleared.\n'
+        continue
+        ;;
+      /compact)
+        compact_conversation
+        continue
+        ;;
+      /sessions)
+        list_sessions
+        continue
+        ;;
+      '') continue ;;
+    esac
+  fi
 
   add_user_text "$user_input"
 
@@ -707,8 +795,9 @@ while true; do
       has_tool_use=0
     fi
 
-    # Print text
-    printf '%s' "$content" | jq -r '.[] | select(.type=="text") | .text'
+    # Extract and print text
+    LAST_ASSISTANT_TEXT=$(printf '%s' "$content" | jq -r '[.[] | select(.type=="text") | .text] | join("\n")')
+    [[ -n "$LAST_ASSISTANT_TEXT" ]] && printf '%s\n' "$LAST_ASSISTANT_TEXT"
 
     # Save assistant response to disk
     add_assistant_response "$content"
@@ -746,4 +835,13 @@ while true; do
     rm -rf "$results_dir"
     add_tool_results "$merged_results"
   done
+
+  # Non-interactive mode: write output and exit after single run
+  if [[ -n "$PROMPT_TEXT" ]]; then
+    if [[ -n "$OUTPUT_FILE" ]] && [[ -n "$LAST_ASSISTANT_TEXT" ]]; then
+      mkdir -p "$(dirname "$OUTPUT_FILE")"
+      printf '%s\n' "$LAST_ASSISTANT_TEXT" > "$OUTPUT_FILE"
+    fi
+    exit 0
+  fi
 done
