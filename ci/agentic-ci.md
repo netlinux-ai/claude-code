@@ -2,6 +2,18 @@
 
 An AI-powered CI/CD system that uses mini-claude as a git `post-receive` hook. When you push to main/master, Claude automatically reviews your code changes and reports results.
 
+## Why NetLinux Agentic CI
+
+Existing AI code review tools — [PR-Agent](https://github.com/qodo-ai/pr-agent), [CodeRabbit](https://www.coderabbit.ai/), Claude Code's own [code-review plugin](https://github.com/anthropics/claude-code/blob/main/plugins/code-review/README.md) — all assume a forge (GitHub, GitLab, Bitbucket) with a PR/MR API to post comments on. They don't work with plain bare git repos served over SSH with gitweb.
+
+This system is different:
+
+- **No forge needed.** Works on any bare git repo with a `post-receive` hook. No GitHub, no GitLab, no PR API — just `git push` and read the log.
+- **Agentic, not passive.** Claude doesn't just review a diff — it can run tests, read files, and execute commands in a cloned working copy. If your repo has a Makefile with a `test` target, Claude will run it.
+- **Minimal infrastructure.** A single bash script (~800 lines), no Docker, no Node.js, no Python runtime. Runs on a 1GB VPS with bash 4.3, curl, and jq.
+- **No API key management.** Piggybacks on Claude Code's OAuth subscription with automatic token refresh — the credential chain sustains itself indefinitely.
+- **Opt-in per repo.** A symlink enables it; removing the symlink disables it. No config files, no YAML, no dashboard.
+
 ## How it works
 
 1. You push to a repo on `projects.netlinux.org.uk`
