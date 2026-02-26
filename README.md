@@ -6,7 +6,7 @@ Claude Code CLI — repackaged for Debian with source-built components, plus a m
 
 ## Contents
 
-### `mini-claude.sh` — Minimal Agentic Shell
+### `netlinux-ai-agent.sh` — Minimal Agentic Shell
 
 A lightweight, transparent alternative to the full Claude Code CLI. It's a single bash script (~750 lines) that gives Claude the ability to run commands, read files, and write files on your machine — driven by a simple terminal conversation loop.
 
@@ -16,7 +16,7 @@ A lightweight, transparent alternative to the full Claude Code CLI. It's a singl
 - Three tools: `bash`, `read_file`, `write_file`
 - Asks for confirmation before running any bash command or writing any file
 - `--dangerously-skip-permissions` flag to bypass all confirmations
-- Persistent sessions stored as files and folders in `~/.mini-claude/sessions/`
+- Persistent sessions stored as files and folders in `~/.netlinux-ai-agent/sessions/`
 - On startup, offers to resume the last session
 - `/sessions` command to list and resume any past session
 - `/clear` to start a fresh session
@@ -34,18 +34,18 @@ A lightweight, transparent alternative to the full Claude Code CLI. It's a singl
 
 **Usage:**
 ```bash
-chmod +x mini-claude.sh
-./mini-claude.sh
+chmod +x netlinux-ai-agent.sh
+./netlinux-ai-agent.sh
 ```
 
 Override the model:
 ```bash
-CLAUDE_MODEL=claude-sonnet-4-6 ./mini-claude.sh
+CLAUDE_MODEL=claude-sonnet-4-6 ./netlinux-ai-agent.sh
 ```
 
 Skip all permission prompts (use with caution):
 ```bash
-./mini-claude.sh --dangerously-skip-permissions
+./netlinux-ai-agent.sh --dangerously-skip-permissions
 ```
 
 Then just type your message at the `you>` prompt.
@@ -60,7 +60,7 @@ Then just type your message at the `you>` prompt.
 
 **Session storage:**
 
-Sessions are stored as directories in `~/.mini-claude/sessions/`, named by timestamp (e.g. `20250222-120000/`). Each message is a numbered subdirectory containing plain text and JSON files:
+Sessions are stored as directories in `~/.netlinux-ai-agent/sessions/`, named by timestamp (e.g. `20250222-120000/`). Each message is a numbered subdirectory containing plain text and JSON files:
 
 ```
 sessions/20250222-120000/
@@ -97,9 +97,9 @@ This repo also contains tooling to repackage the Claude Code CLI for Debian-base
 
 ---
 
-## Differences: `mini-claude.sh` vs Claude Code CLI
+## Differences: `netlinux-ai-agent.sh` vs Claude Code CLI
 
-| | `mini-claude.sh` | Claude Code |
+| | `netlinux-ai-agent.sh` | Claude Code |
 |---|---|---|
 | Size | ~750 lines of bash | ~215 MB compiled Node.js |
 | Dependencies | `curl`, `jq` | Node.js runtime, bundled binaries |

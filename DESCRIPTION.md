@@ -1,8 +1,8 @@
-# mini-claude: A Complete Agentic AI Shell in ~750 Lines of Bash
+# netlinux-ai-agent: A Complete Agentic AI Shell in ~750 Lines of Bash
 
 ## What It Is
 
-`mini-claude.sh` is a self-contained, fully functional agentic coding assistant that runs entirely as a Bash script. It connects to Anthropic's Claude API and gives the model three tools — `bash`, `read_file`, and `write_file` — enabling it to autonomously execute commands, inspect files, write code, and chain multiple actions together to complete complex tasks. The entire thing is a single file with two dependencies: `curl` and `jq`.
+`netlinux-ai-agent.sh` is a self-contained, fully functional agentic coding assistant that runs entirely as a Bash script. It connects to Anthropic's Claude API and gives the model three tools — `bash`, `read_file`, and `write_file` — enabling it to autonomously execute commands, inspect files, write code, and chain multiple actions together to complete complex tasks. The entire thing is a single file with two dependencies: `curl` and `jq`.
 
 It is, in essence, a from-scratch reimplementation of the core agentic loop that powers tools like Claude Code, Cursor, and Aider — stripped down to its absolute fundamentals and written in the most transparent language possible.
 
@@ -10,7 +10,7 @@ It is, in essence, a from-scratch reimplementation of the core agentic loop that
 
 ### The Agentic Loop
 
-The heart of mini-claude is a nested loop:
+The heart of netlinux-ai-agent is a nested loop:
 
 ```
 User types a message
@@ -47,19 +47,19 @@ The `--dangerously-skip-permissions` flag disables all confirmation prompts, all
 
 ### Authentication
 
-Mini-claude supports two authentication methods, tried in order:
+Netlinux-ai-agent supports two authentication methods, tried in order:
 
 1. **`$ANTHROPIC_API_KEY`** — a standard Anthropic API key, sent as `x-api-key`
 2. **Claude Code OAuth** — reads the token from `~/.claude/.credentials.json` (the same credentials file used by Claude Code), checks expiry, and authenticates via Bearer token with the appropriate beta header
 
-This means if you've already run `claude login`, mini-claude works immediately with no additional setup.
+This means if you've already run `claude login`, netlinux-ai-agent works immediately with no additional setup.
 
 ## Session Storage: The Filesystem as Database
 
-This is where mini-claude diverges most interestingly from conventional design. Rather than storing conversation history as a JSON blob or in a database, every message is a directory on the filesystem:
+This is where netlinux-ai-agent diverges most interestingly from conventional design. Rather than storing conversation history as a JSON blob or in a database, every message is a directory on the filesystem:
 
 ```
-~/.mini-claude/sessions/20250222-120000/
+~/.netlinux-ai-agent/sessions/20250222-120000/
   00000-user/
     text.md                    ← "Find all Python files with syntax errors"
   00001-assistant/
@@ -91,7 +91,7 @@ This design has several consequences:
 
 ### Session Resume
 
-On startup, mini-claude offers to resume the most recent session:
+On startup, netlinux-ai-agent offers to resume the most recent session:
 
 ```
 Last session: 20250222-120000 (47 messages). Resume? [Y/n]
@@ -101,7 +101,7 @@ The `/sessions` command lists all saved sessions with message counts and compact
 
 ### Session Repair
 
-When loading a session, mini-claude runs a repair pass that handles:
+When loading a session, netlinux-ai-agent runs a repair pass that handles:
 
 - **Orphaned tool_use messages** — an assistant message requesting tool calls but with no corresponding tool_result following it (e.g. from a crash during tool execution). These are deleted.
 - **Mismatched tool IDs** — tool_result messages whose IDs don't match the preceding tool_use. Both messages are deleted.
@@ -109,7 +109,7 @@ When loading a session, mini-claude runs a repair pass that handles:
 
 ## Conversation Compaction
 
-As conversations grow, they consume more tokens and eventually approach context window limits. Mini-claude handles this through compaction — an approach inspired by Claude Code's own context management.
+As conversations grow, they consume more tokens and eventually approach context window limits. Netlinux-ai-agent handles this through compaction — an approach inspired by Claude Code's own context management.
 
 ### How Compaction Works
 
@@ -125,11 +125,11 @@ The net effect is that the conversation shrinks dramatically while preserving th
 
 ### Auto-Compaction
 
-After every assistant response (when the agent loop completes), mini-claude checks total session size. If it exceeds the threshold, compaction fires automatically. This means long agentic runs self-manage their context without user intervention.
+After every assistant response (when the agent loop completes), netlinux-ai-agent checks total session size. If it exceeds the threshold, compaction fires automatically. This means long agentic runs self-manage their context without user intervention.
 
 ## How It Differs from Claude Code
 
-| Aspect | mini-claude | Claude Code |
+| Aspect | netlinux-ai-agent | Claude Code |
 |---|---|---|
 | **Size** | ~750 lines, single bash file | ~215 MB compiled Node.js application |
 | **Dependencies** | `curl`, `jq` | Node.js runtime, bundled binaries (ripgrep, tree-sitter) |
@@ -145,16 +145,16 @@ After every assistant response (when the agent loop completes), mini-claude chec
 | **System prompt** | None (uses API defaults) | Extensive system prompt with tool documentation, coding guidelines, safety rules |
 | **Cost visibility** | Estimates tokens from file sizes (~chars/4) | Precise token counting from API response metadata |
 
-### What Claude Code Has That mini-claude Doesn't
+### What Claude Code Has That netlinux-ai-agent Doesn't
 
-- **Diff-based editing**: Claude Code can make surgical changes to specific lines in a file without rewriting the whole thing. Mini-claude must read, modify in memory, and write back the entire file.
-- **Project context**: Claude Code automatically understands your project structure, reads `CLAUDE.md` files for project-specific instructions, and builds codebase indexes. Mini-claude starts with zero context — Claude has to explore using tools.
-- **Streaming**: Claude Code streams tokens to the terminal as they're generated. Mini-claude waits for the complete API response before displaying anything.
-- **Sophisticated permission management**: Claude Code lets you define fine-grained rules about what's allowed — specific commands, file path patterns, tools that can auto-approve. Mini-claude has a single binary switch.
-- **MCP integration**: Claude Code can connect to external tool servers via the Model Context Protocol. Mini-claude's tool set is fixed.
-- **Memory**: Claude Code has a persistent memory/notebook tool for storing context across sessions. Mini-claude's compaction summaries serve a similar purpose but less flexibly.
+- **Diff-based editing**: Claude Code can make surgical changes to specific lines in a file without rewriting the whole thing. Netlinux-ai-agent must read, modify in memory, and write back the entire file.
+- **Project context**: Claude Code automatically understands your project structure, reads `CLAUDE.md` files for project-specific instructions, and builds codebase indexes. Netlinux-ai-agent starts with zero context — Claude has to explore using tools.
+- **Streaming**: Claude Code streams tokens to the terminal as they're generated. Netlinux-ai-agent waits for the complete API response before displaying anything.
+- **Sophisticated permission management**: Claude Code lets you define fine-grained rules about what's allowed — specific commands, file path patterns, tools that can auto-approve. Netlinux-ai-agent has a single binary switch.
+- **MCP integration**: Claude Code can connect to external tool servers via the Model Context Protocol. Netlinux-ai-agent's tool set is fixed.
+- **Memory**: Claude Code has a persistent memory/notebook tool for storing context across sessions. Netlinux-ai-agent's compaction summaries serve a similar purpose but less flexibly.
 
-### What mini-claude Has That Claude Code Doesn't
+### What netlinux-ai-agent Has That Claude Code Doesn't
 
 - **Total transparency**: you can read every line, understand every decision, modify any behaviour. There is no compiled code, no bundled runtime, no abstraction layers.
 - **Inspectable sessions**: conversations are plain files you can browse, grep, edit, and version-control. You can see exactly what was sent to the API on every turn.
@@ -166,7 +166,7 @@ After every assistant response (when the agent loop completes), mini-claude chec
 
 ### As a Teaching Tool
 
-Mini-claude is perhaps the clearest possible demonstration of how agentic AI coding tools work. The entire system — authentication, conversation management, tool execution, the agent loop, context compaction — is visible in a single file. There's no framework, no abstraction, no indirection. The API call is a `curl` command. Tool execution is a `case` statement. The agent loop is a `while true`. Anyone who can read bash can understand exactly how an AI agent works.
+Netlinux-ai-agent is perhaps the clearest possible demonstration of how agentic AI coding tools work. The entire system — authentication, conversation management, tool execution, the agent loop, context compaction — is visible in a single file. There's no framework, no abstraction, no indirection. The API call is a `curl` command. Tool execution is a `case` statement. The agent loop is a `while true`. Anyone who can read bash can understand exactly how an AI agent works.
 
 ### As an Engineering Artefact
 
@@ -176,13 +176,13 @@ The build_payload function — which reconstructs the API request from dozens of
 
 ### As a Practical Tool
 
-Despite its simplicity, mini-claude is genuinely useful for real work. Claude with `bash`, `read_file`, and `write_file` can accomplish the vast majority of coding tasks. It can navigate codebases, run tests, fix bugs, refactor code, manage infrastructure, write documentation. The three-tool set isn't a limitation in practice — it's what Claude Code's more specialised tools decompose into anyway. `diff/patch` editing is just `read_file` + `write_file` with fewer tokens. `grep` is just `bash` running grep. The specialised tools in Claude Code are optimisations, not capabilities.
+Despite its simplicity, netlinux-ai-agent is genuinely useful for real work. Claude with `bash`, `read_file`, and `write_file` can accomplish the vast majority of coding tasks. It can navigate codebases, run tests, fix bugs, refactor code, manage infrastructure, write documentation. The three-tool set isn't a limitation in practice — it's what Claude Code's more specialised tools decompose into anyway. `diff/patch` editing is just `read_file` + `write_file` with fewer tokens. `grep` is just `bash` running grep. The specialised tools in Claude Code are optimisations, not capabilities.
 
 The session persistence and compaction mean you can use it for extended multi-session projects. Start working on something, close your terminal, come back days later and resume exactly where you left off. If the conversation gets too long, it automatically summarises and continues.
 
 ### As a Baseline
 
-Mini-claude establishes a useful lower bound: this is the minimum viable agentic coding tool. Everything above this — streaming, diff editing, project awareness, MCP, permission management — is an enhancement, not a requirement. If you're building or evaluating agentic tools, mini-claude shows you what the irreducible core looks like: an API call in a loop, three tools, and a place to store the conversation.
+Netlinux-ai-agent establishes a useful lower bound: this is the minimum viable agentic coding tool. Everything above this — streaming, diff editing, project awareness, MCP, permission management — is an enhancement, not a requirement. If you're building or evaluating agentic tools, netlinux-ai-agent shows you what the irreducible core looks like: an API call in a loop, three tools, and a place to store the conversation.
 
 ---
 

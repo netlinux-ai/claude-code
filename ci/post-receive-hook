@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# post-receive hook — runs mini-claude CI on pushes to main/master
+# post-receive hook — runs netlinux-ai-agent CI on pushes to main/master
 # Symlink into a bare repo's hooks/ directory to enable.
 set -euo pipefail
 
-MINI_CLAUDE="/usr/local/bin/mini-claude"
+NETLINUX_AI_AGENT="/usr/local/bin/netlinux-ai-agent"
 CI_ROOT="/mnt/projects/ci"
-LOCKFILE="/tmp/mini-claude-ci.lock"
+LOCKFILE="/tmp/netlinux-ai-agent-ci.lock"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
 DIFF_LIMIT=20000
 
@@ -50,11 +50,11 @@ REPO_NAME="$(basename "$REPO_DIR" .git)"
   # Lockfile — one CI run at a time on this low-memory server
   exec 9>"$LOCKFILE"
   if ! flock -n 9; then
-    echo "mini-claude CI: another run in progress, skipping $REPO_NAME" >> "$CI_ROOT/skipped.log"
+    echo "netlinux-ai-agent CI: another run in progress, skipping $REPO_NAME" >> "$CI_ROOT/skipped.log"
     exit 0
   fi
 
-  WORKDIR=$(mktemp -d "/tmp/mini-claude-ci-${REPO_NAME}.XXXXXX")
+  WORKDIR=$(mktemp -d "/tmp/netlinux-ai-agent-ci-${REPO_NAME}.XXXXXX")
   cleanup() { rm -rf "$WORKDIR"; }
   trap cleanup EXIT
 
@@ -131,24 +131,24 @@ Keep your response concise and actionable. Focus on what matters."
   # Write header
   {
     printf '=%.0s' {1..60}; printf '\n'
-    printf 'mini-claude CI — %s @ %s\n' "$REPO_NAME" "$(date)"
+    printf 'netlinux-ai-agent CI — %s @ %s\n' "$REPO_NAME" "$(date)"
     printf 'Branch: %s  Commits: %s..%s\n' "$BRANCH" "${OLDREV:0:8}" "${NEWREV:0:8}"
     printf '=%.0s' {1..60}; printf '\n\n'
   } > "$OUTPUT_FILE"
 
-  # Run mini-claude
+  # Run netlinux-ai-agent
   RESPONSE_FILE="$WORKDIR/response.txt"
   export CLAUDE_MODEL
-  export MINI_CLAUDE_SESSIONS="/var/lib/mini-claude/sessions"
-  mkdir -p "$MINI_CLAUDE_SESSIONS"
+  export NETLINUX_AI_AGENT_SESSIONS="/var/lib/netlinux-ai-agent/sessions"
+  mkdir -p "$NETLINUX_AI_AGENT_SESSIONS"
 
-  "$MINI_CLAUDE" --prompt "$PROMPT" --output-file "$RESPONSE_FILE" 2>>"$REPO_CI_DIR/stderr.log" || true
+  "$NETLINUX_AI_AGENT" --prompt "$PROMPT" --output-file "$RESPONSE_FILE" 2>>"$REPO_CI_DIR/stderr.log" || true
 
   # Append response to log
   if [[ -f "$RESPONSE_FILE" ]]; then
     cat "$RESPONSE_FILE" >> "$OUTPUT_FILE"
   else
-    printf '(no response from mini-claude)\n' >> "$OUTPUT_FILE"
+    printf '(no response from netlinux-ai-agent)\n' >> "$OUTPUT_FILE"
   fi
 
   printf '\n---\nCompleted: %s\n' "$(date)" >> "$OUTPUT_FILE"

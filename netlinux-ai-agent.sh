@@ -13,7 +13,7 @@ OUTPUT_FILE=""
 COMPACT_THRESHOLD=320000  # ~80k tokens at chars/4
 COMPACT_KEEP_LAST=10      # keep last N messages verbatim after compaction
 
-SESSIONS_ROOT="${MINI_CLAUDE_SESSIONS:-$HOME/.mini-claude/sessions}"
+SESSIONS_ROOT="${NETLINUX_AI_AGENT_SESSIONS:-$HOME/.netlinux-ai-agent/sessions}"
 mkdir -p "$SESSIONS_ROOT"
 
 SESSION_DIR=""  # current session directory (e.g. sessions/20250222-120000/)
@@ -731,7 +731,7 @@ fi
 # MAIN LOOP
 # =============================================================================
 
-printf 'mini-claude — minimal agentic shell (model: %s)\n' "$MODEL"
+printf 'netlinux-ai-agent — minimal agentic shell (model: %s)\n' "$MODEL"
 if [[ "$SKIP_PERMISSIONS" == true ]]; then
   printf '\033[33m⚠  --dangerously-skip-permissions active: all tool calls run without confirmation\033[0m\n'
 fi
