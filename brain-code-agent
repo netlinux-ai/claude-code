@@ -1,0 +1,1210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# === brain-code-agent — Local LLM agent for NetLinux CI ===
+# Drop-in replacement for mini-claude. Uses llama-server (Qwen2.5-Coder-14B)
+# via OpenAI-compatible API over SSH tunnel, with fallback to mini-claude.
+#
+# Usage:
+#   brain-code-agent --prompt "..."                    # autonomous mode (pipeline)
+#   brain-code-agent --prompt "..." --output-file FILE # write final output to FILE
+#   brain-code-agent --new-session                     # interactive, fresh session
+#   brain-code-agent                                   # interactive, resume last
+#   brain-code-agent --fallback-cloud                  # fall back if tunnel down
+
+readonly VERSION="1.0.0"
+
+# ── Configuration ───────────────────────────────────────────────────────────
+
+LLAMA_URL="${LLAMA_URL:-http://localhost:8090}"
+BRAIN_CODE_MODEL="${BRAIN_CODE_MODEL:-qwen2.5-coder-14b}"
+BRAIN_CODE_FALLBACK="${BRAIN_CODE_FALLBACK:-0}"
+
+SESSION_DIR="${HOME}/.brain-code/sessions"
+TRAINING_DIR="${HOME}/.brain-code/training-data"
+
+# Context management — 8192 token context, ~4 chars/token
+MAX_SESSION_CHARS=20000
+COMPACT_KEEP_MSGS=4
+MAX_OUTPUT_CHARS=15000
+
+# API settings
+MAX_TOKENS=4096
+TEMPERATURE=0.7
+MAX_TOOL_LOOPS=25
+API_TIMEOUT=300
+RETRY_COUNT=3
+RETRY_DELAY=30
+TOOL_TIMEOUT=120
+
+# ── CLI argument parsing ────────────────────────────────────────────────────
+
+PROMPT=""
+OUTPUT_FILE=""
+NEW_SESSION=false
+FALLBACK_CLOUD=false
+INTERACTIVE=true
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --prompt)         PROMPT="$2"; INTERACTIVE=false; shift 2 ;;
+        --output-file)    OUTPUT_FILE="$2"; shift 2 ;;
+        --new-session)    NEW_SESSION=true; shift ;;
+        --fallback-cloud) FALLBACK_CLOUD=true; shift ;;
+        -h|--help)
+            cat <<'EOF'
+brain-code-agent — Local LLM CI agent for NetLinux
+
+Usage:
+  brain-code-agent --prompt "..."              Autonomous mode (pipeline)
+  brain-code-agent --prompt "..." --output-file FILE
+  brain-code-agent --new-session               Interactive, fresh session
+  brain-code-agent                             Interactive, resume last
+  brain-code-agent --fallback-cloud            Fall back to mini-claude
+
+Environment:
+  LLAMA_URL              API endpoint (default: http://localhost:8090)
+  BRAIN_CODE_FALLBACK=1  Enable fallback to mini-claude
+  BRAIN_CODE_MODEL       Model name for training data metadata
+EOF
+            exit 0
+            ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ "$FALLBACK_CLOUD" == "true" ]]; then
+    BRAIN_CODE_FALLBACK=1
+fi
+
+# ── Ensure directories ─────────────────────────────────────────────────────
+
+mkdir -p "$SESSION_DIR" "$TRAINING_DIR"
+
+# ── System prompt ───────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT='You are a CI build agent for NetLinux packages. You build Debian .deb packages from source on Ubuntu 24.04.
+
+Tools: run_command, read_file, write_file, edit_file, glob, grep.
+
+Rules:
+- Read .github/workflows/release-deb.yml first to understand the build process
+- Install build dependencies with apt-get
+- Build the software, then use checkinstall to create a .deb
+- Repack zstd-compressed .debs to xz (ar x, zstd -d, xz, ar rcs)
+- Copy the final .deb to the output directory specified in the task
+- Be concise. Execute steps, do not explain them.
+- If a step fails, diagnose the error and try a different approach.'
+
+# ── Tool definitions (OpenAI function calling format) ───────────────────────
+
+TOOLS_JSON='[
+  {"type":"function","function":{"name":"run_command","description":"Run a bash command","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The bash command to execute"}},"required":["command"]}}},
+  {"type":"function","function":{"name":"read_file","description":"Read a file and return numbered lines","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"}},"required":["path"]}}},
+  {"type":"function","function":{"name":"write_file","description":"Write content to a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Content to write"}},"required":["path","content"]}}},
+  {"type":"function","function":{"name":"edit_file","description":"Replace unique old text with new text in a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"old":{"type":"string","description":"Exact text to find (must be unique)"},"new":{"type":"string","description":"Replacement text"}},"required":["path","old","new"]}}},
+  {"type":"function","function":{"name":"glob","description":"Find files matching a glob pattern","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. *.py)"},"path":{"type":"string","description":"Directory to search in"}},"required":["pattern"]}}},
+  {"type":"function","function":{"name":"grep","description":"Search file contents with regex","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern to search for"},"path":{"type":"string","description":"Directory to search in"},"glob":{"type":"string","description":"File glob filter"}},"required":["pattern"]}}}
+]'
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+
+log() {
+    echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*" >&2
+}
+
+# ── Health check & fallback ─────────────────────────────────────────────────
+
+check_health() {
+    if curl -sf --max-time 5 "${LLAMA_URL}/health" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+do_fallback() {
+    if [[ "$BRAIN_CODE_FALLBACK" == "1" ]] && command -v mini-claude &>/dev/null; then
+        log "Local LLM unavailable, falling back to mini-claude"
+        exec mini-claude "$@"
+    fi
+    log "ERROR: Local LLM at ${LLAMA_URL} is not reachable"
+    log "Start llama-server or set BRAIN_CODE_FALLBACK=1 for cloud fallback"
+    exit 2
+}
+
+# Check health at startup
+if ! check_health; then
+    # Reconstruct original args for fallback
+    ORIG_ARGS=()
+    [[ -n "$PROMPT" ]] && ORIG_ARGS+=(--prompt "$PROMPT")
+    [[ -n "$OUTPUT_FILE" ]] && ORIG_ARGS+=(--output-file "$OUTPUT_FILE")
+    [[ "$NEW_SESSION" == "true" ]] && ORIG_ARGS+=(--new-session)
+    [[ "$FALLBACK_CLOUD" == "true" ]] && ORIG_ARGS+=(--fallback-cloud)
+    do_fallback "${ORIG_ARGS[@]}"
+fi
+
+log "Connected to local LLM at ${LLAMA_URL}"
+
+# ── Session management ──────────────────────────────────────────────────────
+
+CURRENT_SESSION=""
+SESSION_MSG_COUNT=0
+
+new_session() {
+    CURRENT_SESSION="${SESSION_DIR}/$(date -u '+%Y%m%d-%H%M%S')"
+    mkdir -p "$CURRENT_SESSION"
+    SESSION_MSG_COUNT=0
+    log "New session: $CURRENT_SESSION"
+}
+
+find_last_session() {
+    local latest
+    latest=$(ls -1d "${SESSION_DIR}"/[0-9]* 2>/dev/null | sort | tail -1)
+    echo "$latest"
+}
+
+load_session() {
+    local session_path="$1"
+    if [[ ! -d "$session_path" ]]; then
+        log "Session not found: $session_path"
+        return 1
+    fi
+    CURRENT_SESSION="$session_path"
+    SESSION_MSG_COUNT=$(ls -1d "$CURRENT_SESSION"/[0-9]*-* 2>/dev/null | wc -l)
+    log "Loaded session: $CURRENT_SESSION ($SESSION_MSG_COUNT messages)"
+}
+
+msg_dir() {
+    local index="$1" role="$2"
+    printf '%s/%05d-%s' "$CURRENT_SESSION" "$index" "$role"
+}
+
+add_user_text() {
+    local text="$1"
+    local dir
+    dir=$(msg_dir "$SESSION_MSG_COUNT" "user")
+    mkdir -p "$dir"
+    printf '%s' "$text" > "$dir/text.md"
+    SESSION_MSG_COUNT=$((SESSION_MSG_COUNT + 1))
+}
+
+add_assistant_response() {
+    local text="$1" tool_calls_json="$2"
+    local dir
+    dir=$(msg_dir "$SESSION_MSG_COUNT" "assistant")
+    mkdir -p "$dir"
+    [[ -n "$text" ]] && printf '%s' "$text" > "$dir/text.md"
+    [[ -n "$tool_calls_json" && "$tool_calls_json" != "[]" && "$tool_calls_json" != "null" ]] && \
+        printf '%s' "$tool_calls_json" > "$dir/tool_calls.json"
+    SESSION_MSG_COUNT=$((SESSION_MSG_COUNT + 1))
+}
+
+add_tool_results() {
+    # $1 = JSON array of {tool_call_id, name, result}
+    local results_json="$1"
+    local dir
+    dir=$(msg_dir "$SESSION_MSG_COUNT" "tool")
+    mkdir -p "$dir"
+    printf '%s' "$results_json" > "$dir/tool_results.json"
+    SESSION_MSG_COUNT=$((SESSION_MSG_COUNT + 1))
+}
+
+# Build OpenAI messages array from session on disk
+build_messages() {
+    local messages='[]'
+
+    # System message
+    messages=$(python3 -c "
+import json, sys
+msgs = [{'role': 'system', 'content': sys.stdin.read()}]
+print(json.dumps(msgs))
+" <<< "$SYSTEM_PROMPT")
+
+    # Walk session directories in order
+    local dirs=()
+    while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        dirs+=("$d")
+    done < <(ls -1d "$CURRENT_SESSION"/[0-9]*-* 2>/dev/null | sort)
+
+    if [[ ${#dirs[@]} -eq 0 ]]; then
+        echo "$messages"
+        return
+    fi
+
+    # Write dir list to a temp file to avoid argv limits
+    local dirs_file
+    dirs_file=$(mktemp)
+    for d in "${dirs[@]}"; do
+        echo "$d"
+    done > "$dirs_file"
+
+    messages=$(python3 -c "
+import json, sys, os
+
+msgs = json.loads(sys.argv[1])
+dirs_file = sys.argv[2]
+with open(dirs_file) as f:
+    dirs = [line.strip() for line in f if line.strip()]
+
+for d in dirs:
+    basename = os.path.basename(d)
+    # Extract role from dirname: NNNNN-role
+    role = basename.split('-', 1)[1] if '-' in basename else 'unknown'
+
+    if role == 'user':
+        text_file = os.path.join(d, 'text.md')
+        if os.path.isfile(text_file):
+            with open(text_file) as f:
+                msgs.append({'role': 'user', 'content': f.read()})
+
+    elif role == 'assistant':
+        msg = {'role': 'assistant', 'content': ''}
+        text_file = os.path.join(d, 'text.md')
+        if os.path.isfile(text_file):
+            with open(text_file) as f:
+                msg['content'] = f.read()
+        tc_file = os.path.join(d, 'tool_calls.json')
+        if os.path.isfile(tc_file):
+            with open(tc_file) as f:
+                tc = json.load(f)
+                if tc:
+                    msg['tool_calls'] = tc
+        msgs.append(msg)
+
+    elif role == 'tool':
+        tr_file = os.path.join(d, 'tool_results.json')
+        if os.path.isfile(tr_file):
+            with open(tr_file) as f:
+                results = json.load(f)
+                for r in results:
+                    msgs.append({
+                        'role': 'tool',
+                        'tool_call_id': r.get('tool_call_id', ''),
+                        'content': r.get('result', '')
+                    })
+
+    elif role == 'summary':
+        text_file = os.path.join(d, 'text.md')
+        if os.path.isfile(text_file):
+            with open(text_file) as f:
+                msgs.append({'role': 'user', 'content': '[Session summary] ' + f.read()})
+
+print(json.dumps(msgs))
+" "$messages" "$dirs_file")
+
+    rm -f "$dirs_file"
+
+    echo "$messages"
+}
+
+# ── Session size tracking ───────────────────────────────────────────────────
+
+session_char_count() {
+    local total=0
+    local f
+    while IFS= read -r f; do
+        [[ -f "$f" ]] && total=$((total + $(wc -c < "$f")))
+    done < <(find "$CURRENT_SESSION" -type f \( -name '*.md' -o -name '*.json' \) 2>/dev/null)
+    echo "$total"
+}
+
+# ── Compaction ──────────────────────────────────────────────────────────────
+
+compact_session() {
+    local char_count
+    char_count=$(session_char_count)
+
+    if [[ "$char_count" -le "$MAX_SESSION_CHARS" ]]; then
+        return 0
+    fi
+
+    log "Session at ${char_count} chars, compacting (limit: ${MAX_SESSION_CHARS})"
+
+    # Get list of message dirs
+    local all_dirs=()
+    while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        all_dirs+=("$d")
+    done < <(ls -1d "$CURRENT_SESSION"/[0-9]*-* 2>/dev/null | sort)
+
+    local total_msgs=${#all_dirs[@]}
+    if [[ "$total_msgs" -le "$COMPACT_KEEP_MSGS" ]]; then
+        log "Too few messages to compact ($total_msgs)"
+        return 0
+    fi
+
+    # Split: summarize everything before the last COMPACT_KEEP_MSGS messages
+    local split_point=$((total_msgs - COMPACT_KEEP_MSGS))
+    local to_summarize=("${all_dirs[@]:0:$split_point}")
+
+    # Build text to summarize from the messages being removed
+    local summary_source=""
+    for d in "${to_summarize[@]}"; do
+        local role
+        role=$(basename "$d" | sed 's/^[0-9]*-//')
+        for f in "$d"/*.md "$d"/*.json; do
+            [[ -f "$f" ]] || continue
+            local content
+            content=$(<"$f")
+            # Limit how much we include from each file
+            if [[ ${#content} -gt 2000 ]]; then
+                content="${content:0:2000}... (truncated)"
+            fi
+            summary_source+="[${role}] ${content}"$'\n'
+        done
+    done
+
+    # Truncate summary source if too large (keep last ~4000 chars)
+    if [[ ${#summary_source} -gt 8000 ]]; then
+        summary_source="${summary_source: -8000}"
+    fi
+
+    # Call llama-server to generate a summary
+    local summary=""
+    local summary_prompt="Summarize this CI build session concisely. Include: package name, completed steps, files modified, current state, errors encountered. Under 200 words.
+
+${summary_source}"
+
+    local summary_payload
+    summary_payload=$(python3 -c "
+import json, sys
+msgs = [
+    {'role': 'user', 'content': sys.argv[1]}
+]
+payload = {
+    'model': 'local',
+    'messages': msgs,
+    'max_tokens': 512,
+    'temperature': 0.3
+}
+print(json.dumps(payload))
+" "$summary_prompt")
+
+    local summary_response
+    summary_response=$(curl -sf --max-time 120 \
+        -H "Content-Type: application/json" \
+        -d "$summary_payload" \
+        "${LLAMA_URL}/v1/chat/completions" 2>/dev/null) || true
+
+    if [[ -n "$summary_response" ]]; then
+        summary=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+choices = data.get('choices', [])
+if choices:
+    print(choices[0].get('message', {}).get('content', ''))
+" "$summary_response" 2>/dev/null) || true
+    fi
+
+    if [[ -z "$summary" ]]; then
+        # Fallback: just take the last part of the source as the "summary"
+        summary="[Auto-compacted session — previous context truncated. Last known state:]"$'\n'
+        summary+="${summary_source: -2000}"
+        log "Summary generation failed, using truncated context"
+    else
+        log "Generated summary (${#summary} chars)"
+    fi
+
+    # Remove summarized message dirs
+    for d in "${to_summarize[@]}"; do
+        rm -rf "$d"
+    done
+
+    # Renumber remaining dirs starting from 1 (0 will be the summary)
+    local keep_dirs=("${all_dirs[@]:$split_point}")
+    local new_index=1
+    for d in "${keep_dirs[@]}"; do
+        local role
+        role=$(basename "$d" | sed 's/^[0-9]*-//')
+        local new_dir
+        new_dir=$(printf '%s/%05d-%s' "$CURRENT_SESSION" "$new_index" "$role")
+        if [[ "$d" != "$new_dir" ]]; then
+            mv "$d" "$new_dir"
+        fi
+        new_index=$((new_index + 1))
+    done
+
+    # Write summary as message 0
+    local summary_dir
+    summary_dir=$(msg_dir 0 "summary")
+    mkdir -p "$summary_dir"
+    printf '%s' "$summary" > "$summary_dir/text.md"
+
+    SESSION_MSG_COUNT=$new_index
+
+    local new_count
+    new_count=$(session_char_count)
+    log "Compacted: ${char_count} -> ${new_count} chars, ${total_msgs} -> ${SESSION_MSG_COUNT} messages"
+
+    # Emergency truncation if still too big
+    if [[ "$new_count" -gt 24000 ]]; then
+        log "Emergency truncation: still at ${new_count} chars"
+        # Remove oldest non-summary messages until under limit
+        while [[ $(session_char_count) -gt "$MAX_SESSION_CHARS" ]]; do
+            local oldest
+            oldest=$(ls -1d "$CURRENT_SESSION"/[0-9]*-* 2>/dev/null | sort | head -2 | tail -1)
+            [[ -z "$oldest" ]] && break
+            local oldest_role
+            oldest_role=$(basename "$oldest" | sed 's/^[0-9]*-//')
+            [[ "$oldest_role" == "summary" ]] && break
+            rm -rf "$oldest"
+            log "  Removed $oldest"
+        done
+    fi
+}
+
+# ── Training data ───────────────────────────────────────────────────────────
+
+TRAINING_FILE=""
+TRAINING_START_TIME=""
+TRAINING_API_CALLS=0
+TRAINING_TOOL_CALLS=0
+TRAINING_COMPACTIONS=0
+TRAINING_TASK_TYPE=""
+TRAINING_PACKAGE=""
+
+init_training() {
+    TRAINING_FILE="${TRAINING_DIR}/$(date -u '+%Y%m%d-%H%M%S').jsonl"
+    TRAINING_START_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    TRAINING_API_CALLS=0
+    TRAINING_TOOL_CALLS=0
+    TRAINING_COMPACTIONS=0
+
+    # Try to detect task type and package from prompt
+    if [[ -n "$PROMPT" ]]; then
+        if echo "$PROMPT" | grep -qi "fix agent\|fix.*package\|fix.*fail"; then
+            TRAINING_TASK_TYPE="fix"
+        else
+            TRAINING_TASK_TYPE="build"
+        fi
+        # Extract package name (repo name) from prompt
+        TRAINING_PACKAGE=$(echo "$PROMPT" | grep -oP 'netlinux-ai/\K[a-zA-Z0-9_-]+' | head -1) || true
+    fi
+
+    # Record system prompt
+    python3 -c "
+import json, sys
+record = {
+    'type': 'system',
+    'content': sys.stdin.read(),
+    'timestamp': sys.argv[1]
+}
+print(json.dumps(record))
+" "$TRAINING_START_TIME" <<< "$SYSTEM_PROMPT" >> "$TRAINING_FILE"
+
+    # Record user prompt
+    if [[ -n "$PROMPT" ]]; then
+        python3 -c "
+import json, sys
+record = {
+    'type': 'user',
+    'content': sys.stdin.read(),
+    'timestamp': sys.argv[1]
+}
+print(json.dumps(record))
+" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" <<< "$PROMPT" >> "$TRAINING_FILE"
+    fi
+}
+
+record_assistant_response() {
+    local content="$1" tool_calls_json="$2" tokens_used="${3:-0}"
+    [[ -z "$TRAINING_FILE" ]] && return
+
+    TRAINING_API_CALLS=$((TRAINING_API_CALLS + 1))
+
+    python3 -c "
+import json, sys
+
+content = sys.stdin.read()
+tc_json = sys.argv[1]
+tokens = int(sys.argv[2])
+ts = sys.argv[3]
+
+tool_calls = []
+if tc_json and tc_json not in ('[]', 'null', ''):
+    try:
+        tcs = json.loads(tc_json)
+        for tc in tcs:
+            fn = tc.get('function', {})
+            args = fn.get('arguments', '{}')
+            tool_calls.append({
+                'name': fn.get('name', ''),
+                'arguments': json.loads(args) if isinstance(args, str) else args
+            })
+    except:
+        pass
+
+record = {
+    'type': 'assistant',
+    'content': content,
+    'tool_calls': tool_calls,
+    'timestamp': ts,
+    'tokens_used': tokens
+}
+print(json.dumps(record))
+" "$tool_calls_json" "$tokens_used" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" <<< "$content" >> "$TRAINING_FILE"
+}
+
+record_tool_result() {
+    local tool_name="$1" tool_call_id="$2" result="$3" truncated="$4" duration_ms="$5" exit_code="${6:-0}"
+    [[ -z "$TRAINING_FILE" ]] && return
+
+    TRAINING_TOOL_CALLS=$((TRAINING_TOOL_CALLS + 1))
+
+    python3 -c "
+import json, sys
+result = sys.stdin.read()
+record = {
+    'type': 'tool_result',
+    'tool': sys.argv[1],
+    'tool_call_id': sys.argv[2],
+    'result': result,
+    'truncated': sys.argv[3] == 'true',
+    'duration_ms': int(sys.argv[4]),
+    'exit_code': int(sys.argv[5]),
+    'timestamp': sys.argv[6]
+}
+print(json.dumps(record))
+" "$tool_name" "$tool_call_id" "$truncated" "$duration_ms" "$exit_code" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" <<< "$result" >> "$TRAINING_FILE"
+}
+
+record_session_end() {
+    local outcome="$1"
+    [[ -z "$TRAINING_FILE" ]] && return
+
+    local duration_s=0
+    if [[ -n "$TRAINING_START_TIME" ]]; then
+        local start_epoch
+        start_epoch=$(date -d "$TRAINING_START_TIME" +%s 2>/dev/null) || start_epoch=0
+        local now_epoch
+        now_epoch=$(date +%s)
+        duration_s=$((now_epoch - start_epoch))
+    fi
+
+    python3 -c "
+import json, sys
+record = {
+    'type': 'session_end',
+    'outcome': sys.argv[1],
+    'task_type': sys.argv[2],
+    'package': sys.argv[3],
+    'duration_s': int(sys.argv[4]),
+    'api_calls': int(sys.argv[5]),
+    'tool_calls': int(sys.argv[6]),
+    'compactions': int(sys.argv[7]),
+    'model': sys.argv[8],
+    'timestamp': sys.argv[9]
+}
+print(json.dumps(record))
+" "$outcome" "${TRAINING_TASK_TYPE:-unknown}" "${TRAINING_PACKAGE:-unknown}" \
+  "$duration_s" "$TRAINING_API_CALLS" "$TRAINING_TOOL_CALLS" \
+  "$TRAINING_COMPACTIONS" "$BRAIN_CODE_MODEL" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$TRAINING_FILE"
+}
+
+# ── Tool implementations (ported from brain-code) ──────────────────────────
+
+truncate_output() {
+    local text="$1" max="${2:-$MAX_OUTPUT_CHARS}"
+    if [[ ${#text} -gt $max ]]; then
+        local head_size=$((max * 2 / 3))
+        local tail_size=$((max / 3))
+        local head_part="${text:0:$head_size}"
+        local tail_part="${text: -$tail_size}"
+        local omitted=$(( ${#text} - head_size - tail_size ))
+        echo "${head_part}"$'\n'"... (${omitted} chars omitted)"$'\n'"${tail_part}"
+        return 1  # signal truncation
+    fi
+    echo "$text"
+    return 0
+}
+
+tool_run_command() {
+    local params="$1"
+    local command
+    command=$(printf '%s' "$params" | python3 -c "import json,sys; print(json.load(sys.stdin)['command'])" 2>/dev/null)
+
+    if [[ -z "$command" ]]; then
+        echo "Error: missing 'command' parameter"
+        return 0
+    fi
+
+    log "  \$ $command"
+
+    local output exit_code=0 start_ms
+    start_ms=$(date +%s%3N)
+    output=$(timeout "$TOOL_TIMEOUT" bash -c "$command" 2>&1) || exit_code=$?
+    local duration_ms=$(( $(date +%s%3N) - start_ms ))
+
+    local truncated=false
+    local truncated_output
+    truncated_output=$(truncate_output "$output") || truncated=true
+
+    if [[ $exit_code -ne 0 ]]; then
+        truncated_output="${truncated_output}"$'\n'"[exit code: ${exit_code}]"
+    fi
+
+    # Record for training
+    record_tool_result "run_command" "${CURRENT_TOOL_CALL_ID:-}" "$truncated_output" "$truncated" "$duration_ms" "$exit_code"
+
+    printf '%s' "$truncated_output"
+}
+
+tool_read_file() {
+    local params="$1"
+    local path
+    path=$(printf '%s' "$params" | python3 -c "import json,sys; print(json.load(sys.stdin)['path'])" 2>/dev/null)
+
+    if [[ -z "$path" ]]; then
+        echo "Error: missing 'path' parameter"
+        return 0
+    fi
+    [[ "$path" != /* ]] && path="$(pwd)/$path"
+
+    if [[ ! -f "$path" ]]; then
+        echo "Error: File not found: $path"
+        return 0
+    fi
+
+    local start_ms
+    start_ms=$(date +%s%3N)
+    local output
+    output=$(cat -n "$path" 2>&1 | head -500)
+    local lines
+    lines=$(wc -l < "$path")
+    if [[ "$lines" -gt 500 ]]; then
+        output+=$'\n'"... (truncated, showing 500 of $lines lines)"
+    fi
+    local duration_ms=$(( $(date +%s%3N) - start_ms ))
+
+    local truncated=false
+    local truncated_output
+    truncated_output=$(truncate_output "$output") || truncated=true
+
+    record_tool_result "read_file" "${CURRENT_TOOL_CALL_ID:-}" "$truncated_output" "$truncated" "$duration_ms" "0"
+    printf '%s' "$truncated_output"
+}
+
+tool_write_file() {
+    local params="$1"
+    local start_ms
+    start_ms=$(date +%s%3N)
+
+    local output
+    output=$(python3 -c "
+import json, sys, os
+params = json.load(sys.stdin)
+path = params['path']
+content = params['content']
+if not os.path.isabs(path):
+    path = os.path.join(os.getcwd(), path)
+os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+with open(path, 'w') as f:
+    f.write(content)
+print(f'Wrote {len(content)} bytes to {path}')
+" <<< "$params" 2>&1)
+    local duration_ms=$(( $(date +%s%3N) - start_ms ))
+
+    record_tool_result "write_file" "${CURRENT_TOOL_CALL_ID:-}" "$output" "false" "$duration_ms" "0"
+    printf '%s' "$output"
+}
+
+tool_edit_file() {
+    local params="$1"
+    local start_ms
+    start_ms=$(date +%s%3N)
+
+    local output
+    output=$(python3 -c "
+import json, sys, os
+params = json.load(sys.stdin)
+path = params['path']
+old = params['old']
+new = params['new']
+if not os.path.isabs(path):
+    path = os.path.join(os.getcwd(), path)
+if not os.path.isfile(path):
+    print(f'Error: File not found: {path}')
+    sys.exit(0)
+with open(path, 'r') as f:
+    content = f.read()
+if old not in content:
+    print('Error: old text not found in file')
+    sys.exit(0)
+count = content.count(old)
+if count > 1:
+    print(f'Error: old text found {count} times (must be unique). Add more context.')
+    sys.exit(0)
+content = content.replace(old, new, 1)
+with open(path, 'w') as f:
+    f.write(content)
+print(f'Edited {path} successfully')
+" <<< "$params" 2>&1)
+    local duration_ms=$(( $(date +%s%3N) - start_ms ))
+
+    record_tool_result "edit_file" "${CURRENT_TOOL_CALL_ID:-}" "$output" "false" "$duration_ms" "0"
+    printf '%s' "$output"
+}
+
+tool_glob() {
+    local params="$1"
+    local pattern path
+    pattern=$(printf '%s' "$params" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pattern'])" 2>/dev/null)
+    path=$(printf '%s' "$params" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('path','.'))" 2>/dev/null)
+
+    if [[ -z "$pattern" ]]; then
+        echo "Error: missing 'pattern' parameter"
+        return 0
+    fi
+    [[ "$path" != /* ]] && path="$(pwd)/$path"
+
+    local start_ms
+    start_ms=$(date +%s%3N)
+    local output
+    output=$(find "$path" -name "$pattern" -type f 2>/dev/null | head -100 | sort)
+    local count
+    count=$(find "$path" -name "$pattern" -type f 2>/dev/null | wc -l)
+    [[ "$count" -gt 100 ]] && output+=$'\n'"... (showing 100 of $count matches)"
+    local duration_ms=$(( $(date +%s%3N) - start_ms ))
+
+    local truncated=false
+    local truncated_output
+    truncated_output=$(truncate_output "$output") || truncated=true
+
+    record_tool_result "glob" "${CURRENT_TOOL_CALL_ID:-}" "$truncated_output" "$truncated" "$duration_ms" "0"
+    printf '%s' "$truncated_output"
+}
+
+tool_grep() {
+    local params="$1"
+    local pattern path file_glob
+    pattern=$(printf '%s' "$params" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pattern'])" 2>/dev/null)
+    path=$(printf '%s' "$params" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('path','.'))" 2>/dev/null)
+    file_glob=$(printf '%s' "$params" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('glob',''))" 2>/dev/null)
+
+    if [[ -z "$pattern" ]]; then
+        echo "Error: missing 'pattern' parameter"
+        return 0
+    fi
+    [[ "$path" != /* ]] && path="$(pwd)/$path"
+
+    local start_ms
+    start_ms=$(date +%s%3N)
+    local grep_args=(-rn "$pattern" "$path")
+    [[ -n "$file_glob" ]] && grep_args+=(--include="$file_glob")
+    local output
+    output=$(grep "${grep_args[@]}" 2>/dev/null | head -100 || echo "(no matches)")
+    local duration_ms=$(( $(date +%s%3N) - start_ms ))
+
+    local truncated=false
+    local truncated_output
+    truncated_output=$(truncate_output "$output") || truncated=true
+
+    record_tool_result "grep" "${CURRENT_TOOL_CALL_ID:-}" "$truncated_output" "$truncated" "$duration_ms" "0"
+    printf '%s' "$truncated_output"
+}
+
+dispatch_tool() {
+    local tool_name="$1" params="$2"
+
+    log "  [tool] $tool_name"
+
+    case "$tool_name" in
+        run_command)  tool_run_command "$params" ;;
+        read_file)    tool_read_file "$params" ;;
+        write_file)   tool_write_file "$params" ;;
+        edit_file)    tool_edit_file "$params" ;;
+        glob)         tool_glob "$params" ;;
+        grep)         tool_grep "$params" ;;
+        *)            echo "Error: Unknown tool '$tool_name'" ;;
+    esac
+}
+
+# ── API call ────────────────────────────────────────────────────────────────
+
+LAST_API_RESPONSE=""
+
+call_api() {
+    local messages_json="$1"
+
+    # Build request payload
+    local payload
+    payload=$(python3 -c "
+import json, sys
+messages = json.loads(sys.argv[1])
+tools = json.loads(sys.argv[2])
+payload = {
+    'model': 'local',
+    'messages': messages,
+    'tools': tools,
+    'max_tokens': int(sys.argv[3]),
+    'temperature': float(sys.argv[4])
+}
+print(json.dumps(payload))
+" "$messages_json" "$TOOLS_JSON" "$MAX_TOKENS" "$TEMPERATURE")
+
+    # Save last payload for debugging (also used as curl input)
+    local payload_file
+    payload_file=$(mktemp)
+    printf '%s' "$payload" > "$payload_file"
+    [[ -n "$CURRENT_SESSION" ]] && cp "$payload_file" "$CURRENT_SESSION/.last_payload.json"
+
+    # Make API call with retries
+    local attempt=0
+    local response=""
+    while [[ $attempt -lt $RETRY_COUNT ]]; do
+        attempt=$((attempt + 1))
+
+        response=$(curl -sf --max-time "$API_TIMEOUT" \
+            -H "Content-Type: application/json" \
+            -d @"$payload_file" \
+            "${LLAMA_URL}/v1/chat/completions" 2>/dev/null) || true
+
+        if [[ -n "$response" ]]; then
+            # Verify it's valid JSON with choices
+            if python3 -c "import json,sys; d=json.loads(sys.argv[1]); assert 'choices' in d" "$response" 2>/dev/null; then
+                break
+            fi
+            log "API returned invalid response (attempt $attempt)"
+            response=""
+        else
+            log "API call failed (attempt $attempt/$RETRY_COUNT)"
+        fi
+
+        if [[ $attempt -lt $RETRY_COUNT ]]; then
+            log "Retrying in ${RETRY_DELAY}s..."
+            sleep "$RETRY_DELAY"
+
+            # Re-check health
+            if ! check_health; then
+                log "LLM server appears down"
+                if [[ "$BRAIN_CODE_FALLBACK" == "1" ]] && command -v mini-claude &>/dev/null; then
+                    log "Server died mid-session, cannot fallback cleanly. Exiting."
+                fi
+                return 1
+            fi
+        fi
+    done
+
+    rm -f "$payload_file"
+
+    if [[ -z "$response" ]]; then
+        log "ERROR: All API attempts failed"
+        return 1
+    fi
+
+    [[ -n "$CURRENT_SESSION" ]] && printf '%s' "$response" > "$CURRENT_SESSION/.last_response.json"
+    LAST_API_RESPONSE="$response"
+    return 0
+}
+
+# Parse API response into temp files for reliable extraction
+# Sets: PARSED_CONTENT, PARSED_TOOL_CALLS, PARSED_FINISH, PARSED_TOKENS
+PARSED_CONTENT=""
+PARSED_TOOL_CALLS="[]"
+PARSED_FINISH=""
+PARSED_TOKENS=0
+
+parse_response() {
+    local response="$1"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    python3 -c "
+import json, sys, os
+
+data = json.loads(sys.argv[1])
+tmpdir = sys.argv[2]
+choice = data.get('choices', [{}])[0]
+message = choice.get('message', {})
+usage = data.get('usage', {})
+
+content = message.get('content', '') or ''
+tool_calls = message.get('tool_calls', []) or []
+finish = choice.get('finish_reason', '')
+tokens = usage.get('completion_tokens', 0)
+
+with open(os.path.join(tmpdir, 'content'), 'w') as f:
+    f.write(content)
+with open(os.path.join(tmpdir, 'tool_calls'), 'w') as f:
+    f.write(json.dumps(tool_calls))
+with open(os.path.join(tmpdir, 'finish'), 'w') as f:
+    f.write(finish)
+with open(os.path.join(tmpdir, 'tokens'), 'w') as f:
+    f.write(str(tokens))
+" "$response" "$tmpdir"
+
+    PARSED_CONTENT=$(<"$tmpdir/content")
+    PARSED_TOOL_CALLS=$(<"$tmpdir/tool_calls")
+    PARSED_FINISH=$(<"$tmpdir/finish")
+    PARSED_TOKENS=$(<"$tmpdir/tokens")
+
+    rm -rf "$tmpdir"
+}
+
+# ── Main agentic loop ──────────────────────────────────────────────────────
+
+FINAL_OUTPUT=""
+
+run_agent() {
+    local user_message="$1"
+    local iteration=0
+
+    # Add user message to session
+    add_user_text "$user_message"
+
+    while [[ $iteration -lt $MAX_TOOL_LOOPS ]]; do
+        iteration=$((iteration + 1))
+        log "Agent iteration $iteration"
+
+        # Build messages from session
+        local messages
+        messages=$(build_messages)
+
+        # Call API
+        if ! call_api "$messages"; then
+            log "API call failed at iteration $iteration"
+            record_session_end "fail"
+            return 1
+        fi
+
+        # Parse response into PARSED_* variables
+        parse_response "$LAST_API_RESPONSE"
+
+        local content="$PARSED_CONTENT"
+        local tool_calls_json="$PARSED_TOOL_CALLS"
+        local finish_reason="$PARSED_FINISH"
+        local tokens_used="$PARSED_TOKENS"
+
+        log "Response: ${#content} chars, finish=$finish_reason, tokens=$tokens_used"
+
+        # Display assistant text
+        if [[ -n "$content" ]]; then
+            echo "$content" >&2
+            FINAL_OUTPUT="$content"
+        fi
+
+        # Record for training
+        record_assistant_response "$content" "$tool_calls_json" "${tokens_used:-0}"
+
+        # Save assistant response to session
+        add_assistant_response "$content" "$tool_calls_json"
+
+        # Check if there are tool calls
+        local has_tool_calls
+        has_tool_calls=$(python3 -c "
+import json, sys
+tc = json.loads(sys.argv[1])
+print('yes' if tc else 'no')
+" "$tool_calls_json" 2>/dev/null) || has_tool_calls="no"
+
+        if [[ "$has_tool_calls" != "yes" ]]; then
+            log "No tool calls, agent complete"
+            break
+        fi
+
+        # Extract tool calls into a temp dir for reliable iteration
+        local tc_tmpdir
+        tc_tmpdir=$(mktemp -d)
+
+        python3 -c "
+import json, sys, os
+
+tool_calls = json.loads(sys.argv[1])
+tmpdir = sys.argv[2]
+
+for i, tc in enumerate(tool_calls):
+    tc_id = tc.get('id', f'call_{i}')
+    fn = tc.get('function', {})
+    name = fn.get('name', '')
+    args_str = fn.get('arguments', '{}')
+    try:
+        args = json.loads(args_str) if isinstance(args_str, str) else args_str
+    except:
+        args = {}
+
+    prefix = os.path.join(tmpdir, f'{i:03d}')
+    with open(prefix + '.id', 'w') as f: f.write(tc_id)
+    with open(prefix + '.name', 'w') as f: f.write(name)
+    with open(prefix + '.args', 'w') as f: f.write(json.dumps(args))
+    print(i)
+" "$tool_calls_json" "$tc_tmpdir"
+
+        # Execute each tool call and collect results
+        local all_tool_results=()
+        for id_file in "$tc_tmpdir"/*.id; do
+            [[ -f "$id_file" ]] || continue
+            local prefix="${id_file%.id}"
+
+            local tc_id tc_name tc_args
+            tc_id=$(<"$prefix.id")
+            tc_name=$(<"$prefix.name")
+            tc_args=$(<"$prefix.args")
+
+            CURRENT_TOOL_CALL_ID="$tc_id"
+
+            local result
+            result=$(dispatch_tool "$tc_name" "$tc_args")
+
+            # Build result JSON safely via python
+            local result_json
+            result_json=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'tool_call_id': sys.argv[1],
+    'name': sys.argv[2],
+    'result': sys.stdin.read()
+}))
+" "$tc_id" "$tc_name" <<< "$result")
+
+            all_tool_results+=("$result_json")
+        done
+
+        rm -rf "$tc_tmpdir"
+
+        # Build tool results JSON array
+        local results_json="["
+        local first=true
+        for r in "${all_tool_results[@]}"; do
+            [[ "$first" == "true" ]] && first=false || results_json+=","
+            results_json+="$r"
+        done
+        results_json+="]"
+
+        # Save tool results to session
+        add_tool_results "$results_json"
+
+        # Compact if needed
+        compact_session
+
+        # Track compactions
+        local post_compact_count
+        post_compact_count=$(session_char_count)
+        if [[ "$post_compact_count" -lt "$MAX_SESSION_CHARS" ]] && [[ $iteration -gt 1 ]]; then
+            TRAINING_COMPACTIONS=$((TRAINING_COMPACTIONS + 1))
+        fi
+    done
+
+    if [[ $iteration -ge $MAX_TOOL_LOOPS ]]; then
+        log "Reached max tool loops ($MAX_TOOL_LOOPS)"
+    fi
+}
+
+# ── Outcome detection ───────────────────────────────────────────────────────
+
+detect_outcome() {
+    local exit_code="$1"
+
+    if [[ "$exit_code" -eq 124 ]]; then
+        echo "timeout"
+        return
+    fi
+
+    if [[ "$exit_code" -ne 0 ]]; then
+        echo "fail"
+        return
+    fi
+
+    # Check if a .deb was produced (look for it in the output or final text)
+    if [[ -n "$OUTPUT_FILE" && -f "$OUTPUT_FILE" ]]; then
+        if grep -q '\.deb' "$OUTPUT_FILE" 2>/dev/null; then
+            echo "success"
+            return
+        fi
+    fi
+
+    if echo "$FINAL_OUTPUT" | grep -qi '\.deb\|successfully\|complete\|built' 2>/dev/null; then
+        echo "success"
+        return
+    fi
+
+    echo "fail"
+}
+
+# ── Interactive mode ────────────────────────────────────────────────────────
+
+run_interactive() {
+    if [[ "$NEW_SESSION" == "true" ]] || [[ -z "$(find_last_session)" ]]; then
+        new_session
+    else
+        load_session "$(find_last_session)"
+    fi
+
+    init_training
+
+    echo "brain-code-agent v${VERSION} — local LLM CI agent"
+    echo "Model: ${BRAIN_CODE_MODEL} via ${LLAMA_URL}"
+    echo "Session: ${CURRENT_SESSION}"
+    echo "Type 'exit' or Ctrl+D to quit"
+    echo
+
+    while true; do
+        local input
+        if ! IFS= read -r -e -p "> " input; then
+            echo
+            break
+        fi
+
+        [[ -z "${input// /}" ]] && continue
+        [[ "$input" == "exit" || "$input" == "quit" ]] && break
+
+        run_agent "$input"
+        echo
+    done
+
+    record_session_end "$(detect_outcome 0)"
+}
+
+# ── Pipeline (autonomous) mode ──────────────────────────────────────────────
+
+run_pipeline() {
+    new_session
+    init_training
+
+    log "Running in pipeline mode"
+    log "Prompt: ${PROMPT:0:200}..."
+
+    run_agent "$PROMPT"
+    local exit_code=$?
+
+    # Write final output
+    if [[ -n "$OUTPUT_FILE" ]]; then
+        if [[ -n "$FINAL_OUTPUT" ]]; then
+            printf '%s\n' "$FINAL_OUTPUT" > "$OUTPUT_FILE"
+            log "Output written to $OUTPUT_FILE"
+        else
+            printf 'No output generated\n' > "$OUTPUT_FILE"
+            log "No output to write"
+        fi
+    fi
+
+    # Write session summary
+    if [[ -n "$CURRENT_SESSION" ]]; then
+        {
+            echo "# Session Summary"
+            echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "Model: ${BRAIN_CODE_MODEL}"
+            echo "API calls: ${TRAINING_API_CALLS}"
+            echo "Tool calls: ${TRAINING_TOOL_CALLS}"
+            echo "Compactions: ${TRAINING_COMPACTIONS}"
+            echo ""
+            echo "## Final Output"
+            echo "$FINAL_OUTPUT"
+        } > "$CURRENT_SESSION/summary.md"
+    fi
+
+    local outcome
+    outcome=$(detect_outcome "$exit_code")
+    record_session_end "$outcome"
+
+    log "Session complete: outcome=$outcome, api_calls=$TRAINING_API_CALLS, tool_calls=$TRAINING_TOOL_CALLS"
+    return $exit_code
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+if [[ -n "$PROMPT" ]]; then
+    run_pipeline
+else
+    run_interactive
+fi
