@@ -1,0 +1,18 @@
+[Unit]
+Description=Reverse SSH tunnel for llama-server and remote command access
+After=network.target
+
+[Service]
+Type=simple
+User=graham
+ExecStart=/usr/bin/ssh -N \
+    -R 8090:127.0.0.1:8080 \
+    -R 2222:127.0.0.1:22 \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no \
+    graham@147.182.205.211
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
