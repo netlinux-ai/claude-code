@@ -292,17 +292,18 @@ start_llama_server() {
 
 stop_llama_server() {
     log "Stopping llama-server on grahams-brain..."
-    $BRAIN_SSH "pkill -f llama-server 2>/dev/null || true" 2>/dev/null || true
+    # Use the PID file or find the exact process; avoid pkill -f which matches ssh args
+    $BRAIN_SSH "pid=\$(pgrep -x llama-server) && kill \$pid 2>/dev/null || true" 2>/dev/null || true
 
-    # Verify it stopped and GPU memory is freed
-    sleep 2
-    if $BRAIN_SSH "pgrep -f llama-server >/dev/null 2>&1"; then
+    # Wait for graceful shutdown
+    sleep 3
+    if $BRAIN_SSH "pgrep -x llama-server >/dev/null 2>&1"; then
         log "  llama-server still running, sending SIGKILL"
-        $BRAIN_SSH "pkill -9 -f llama-server 2>/dev/null || true" 2>/dev/null || true
+        $BRAIN_SSH "pid=\$(pgrep -x llama-server) && kill -9 \$pid 2>/dev/null || true" 2>/dev/null || true
         sleep 2
     fi
 
-    if ! $BRAIN_SSH "pgrep -f llama-server >/dev/null 2>&1"; then
+    if ! $BRAIN_SSH "pgrep -x llama-server >/dev/null 2>&1"; then
         log "llama-server stopped, GPU VRAM freed"
     else
         log "WARNING: llama-server may still be running on grahams-brain"
