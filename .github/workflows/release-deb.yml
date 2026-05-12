@@ -1,28 +1,102 @@
-name: Trigger dev build
-# All build/test/publish happens on dev (the netlinux nightly host).
-# This GHA workflow is a thin trigger: on every push, sign and POST the
-# commit info to the apt-server webhook, which SSHes to dev and starts
-# a single-repo build for both bookworm and resolute suites.
-
-on:
+# Build manifest — replayed by the netlinux dev pipeline.
+# Not auto-triggered in GHA; use `gh workflow run release-deb.yml` to
+# run manually on a GitHub-hosted runner.
+name: Build .deb package (dual-suite)
+true:
   push:
-
+    branches:
+    - main
+permissions:
+  contents: write
 jobs:
-  trigger:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - target: bookworm
+          container: debian:bookworm
+        - target: resolute
+          container: ubuntu:26.04
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.container }}
     steps:
-      - name: Notify dev build pipeline
-        env:
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-          REF: ${{ github.ref }}
-          SECRET: ${{ secrets.WEBHOOK_SECRET }}
-        run: |
-          PAYLOAD=$(printf '{"repo":"%s","sha":"%s","ref":"%s"}' "$REPO" "$SHA" "$REF")
-          SIGNATURE=$(printf %s "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" -binary | xxd -p -c 256)
-          echo "Dispatching build for $REPO @ ${SHA:0:8} ($REF)"
-          curl -sSf -X POST \
-            -H "Content-Type: application/json" \
-            -H "X-Webhook-Signature: sha256=${SIGNATURE}" \
-            -d "$PAYLOAD" \
-            https://packages.netlinux.co.uk/webhook/build
+    - name: Bootstrap container
+      run: "apt-get update\napt-get install -y --no-install-recommends \\\n  ca-certificates curl git xz-utils zstd \\\n \
+        \ build-essential dpkg-dev sudo\n"
+    - uses: actions/checkout@v4
+    - name: Install build dependencies
+      run: "apt-get update\napt-get install -y \\\n  checkinstall nodejs npm \\\n  build-essential pkg-config \\\n  libpcre2-dev\n"
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+    - name: Download, beautify, and build
+      run: 'chmod +x scripts/build.sh
+
+        bash scripts/build.sh
+
+        '
+    - name: Determine version
+      id: version
+      run: 'TARBALL=$(ls anthropic-ai-claude-code-*.tgz)
+
+        base=$(echo "$TARBALL" | sed ''s/anthropic-ai-claude-code-\(.*\)\.tgz/\1/'')
+
+        rev=${{ github.run_number }}
+
+        echo "version=${base}-${rev}netlinux1~${{ matrix.target }}1" >> "$GITHUB_OUTPUT"
+
+        echo "tag=v${base}-${rev}netlinux1~${{ matrix.target }}1" >> "$GITHUB_OUTPUT"
+
+        echo "base=${base}" >> "$GITHUB_OUTPUT"
+
+        '
+    - name: Package with checkinstall
+      run: "checkinstall --default \\\n  --pkgname=claude-code \\\n  --pkgversion=\"${{ steps.version.outputs.version }}\"\
+        \ \\\n  --maintainer=\"graham@netlinux.co.uk\" \\\n  --requires=\"nodejs \\(\\>= 18\\)\" \\\n  --pkggroup=\"devel\"\
+        \ \\\n  --pkglicense=\"Anthropic\" \\\n  --nodoc \\\n  --pakdir=. \\\n  --install=no \\\n  --fstrans=no \\\n  make\
+        \ install\n"
+    - name: Repack .deb for reprepro compatibility
+      run: "DEB=$(ls claude-code_*.deb)\nchmod 666 \"$DEB\"\nmkdir repack && cd repack\nar x \"../$DEB\"\nfor f in *.zst;\
+        \ do\n  [ -f \"$f\" ] || continue\n  zstd -d \"$f\"\n  xz \"${f%.zst}\"\n  rm \"$f\"\ndone\nrm \"../$DEB\"\nar rcs\
+        \ \"../$DEB\" debian-binary control.tar.xz data.tar.xz\n"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: deb-${{ matrix.target }}
+        path: '**/*.deb
+
+          '
+        if-no-files-found: error
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    - name: Compute tag
+      id: tag
+      run: echo "tag=v${{ github.run_number }}-dualsuite" >> "$GITHUB_OUTPUT"
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        name: Build ${{ github.run_number }} (bookworm + resolute)
+        body: 'Dual-suite build from commit ${{ github.sha }}.
+
+          Both ~bookworm1 and ~resolute1 .debs are attached.
+
+          '
+        files: artifacts/**/*.deb
+        fail_on_unmatched_files: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Notify package repository
+      run: "sleep 5\nPAYLOAD='{\"repo\":\"netlinux-ai/claude-code\",\"tag\":\"${{ steps.tag.outputs.tag }}\"}'\nSIGNATURE=$(echo\
+        \ -n \"$PAYLOAD\" \\\n  | openssl dgst -sha256 -hmac \"${{ secrets.WEBHOOK_SECRET }}\" -binary \\\n  | xxd -p -c 256)\n\
+        curl -sf -X POST \\\n  -H \"Content-Type: application/json\" \\\n  -H \"X-Webhook-Signature: sha256=${SIGNATURE}\"\
+        \ \\\n  -d \"$PAYLOAD\" \\\n  https://packages.netlinux.co.uk/webhook/update-repo\n"
+'on':
+  workflow_dispatch: null
